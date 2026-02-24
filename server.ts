@@ -265,6 +265,90 @@ app.post('/api/translate', async (req, res) => {
   }
 });
 
+app.post('/api/translate-stream', async (req, res) => {
+  const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
+  const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
+  if (!DEEPSEEK_API_KEY || placeholders.some(p => DEEPSEEK_API_KEY.includes(p))) {
+    return res.status(503).json({
+      error: '请先配置 DeepSeek API Key。在 bilingual-editorial 目录下创建 .env.local，填写：DEEPSEEK_API_KEY=你的密钥'
+    });
+  }
+
+  const write = (obj: object) => {
+    res.write(JSON.stringify(obj) + '\n');
+    if (typeof (res as unknown as { flush?: () => void }).flush === 'function') {
+      (res as unknown as { flush: () => void }).flush();
+    }
+  };
+
+  try {
+    const { paragraphs } = req.body as { paragraphs: string[] };
+
+    if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+      return res.status(400).json({ error: 'paragraphs is required' });
+    }
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
+    const total = chunks.length;
+    const allTranslations: { en: string; zh: string }[] = [];
+    let firstJson: Record<string, unknown> = { title: { en: '', zh: '' }, author: { en: '', zh: '' }, analysis: null };
+
+    write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
+
+    // 第一块：完整 prompt（含标题/作者/分析）
+    const fj = await callDeepSeek(buildFullPrompt(chunks[0]), DEEPSEEK_API_KEY);
+    if (!Array.isArray(fj?.translation)) {
+      write({ type: 'error', message: '模型返回格式异常，请重试' });
+      return res.end();
+    }
+    firstJson = fj;
+    allTranslations.push(...mergeZhWithParagraphs(chunks[0], fj.translation as unknown[]));
+    const pct1 = Math.round((1 / total) * 100);
+    write({ type: 'progress', chunk: 1, total, percent: pct1, step: `翻译第 1/${total} 段` });
+
+    // 后续块：仅翻译，顺序调用以支持进度推送
+    for (let i = 1; i < chunks.length; i++) {
+      const chunkJson = await callDeepSeek(buildTranslationOnlyPrompt(chunks[i]), DEEPSEEK_API_KEY);
+      if (Array.isArray(chunkJson?.translation)) {
+        allTranslations.push(...mergeZhWithParagraphs(chunks[i], chunkJson.translation as unknown[]));
+      }
+      const pct = Math.round(((i + 1) / total) * 100);
+      write({ type: 'progress', chunk: i + 1, total, percent: pct, step: `翻译第 ${i + 1}/${total} 段` });
+    }
+
+    if (!firstJson.title) firstJson.title = { en: '', zh: '' };
+    if (!firstJson.author) firstJson.author = { en: '', zh: '' };
+
+    const fallback = extractTitleAuthorFromTranslation(allTranslations);
+    const isEmpty = (t: { en?: string; zh?: string }) => {
+      const v = (t?.en?.trim() || t?.zh?.trim() || '').replace(/[—\-]/g, '');
+      return !v;
+    };
+    if (isEmpty(firstJson.title as object) && (fallback.title?.en || fallback.title?.zh)) {
+      firstJson.title = fallback.title;
+    }
+    if (isEmpty(firstJson.author as object) && (fallback.author?.en || fallback.author?.zh)) {
+      firstJson.author = fallback.author;
+    }
+
+    write({
+      type: 'done',
+      result: { ...firstJson, translation: allTranslations }
+    });
+    res.end();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    console.error(err);
+    write({ type: 'error', message: msg });
+    res.end();
+  }
+});
+
 // 历史记录（多设备同步，需 DATABASE_URL）
 const TABLE_SQL = `CREATE TABLE IF NOT EXISTS translations (
   id TEXT PRIMARY KEY,

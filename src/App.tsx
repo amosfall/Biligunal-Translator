@@ -59,6 +59,7 @@ export default function App() {
   const [title, setTitle] = useState({ zh: "致\n斯蒂芬", en: "To\nStéphane" });
   const [author, setAuthor] = useState({ zh: "艾琳·迈尔斯", en: "Eileen Myles" });
   const [isTranslating, setIsTranslating] = useState(false);
+  const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>(() => {
@@ -153,7 +154,56 @@ export default function App() {
     fetch(`/api/history?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
   };
 
-  const translateAndAnalyze = async (paragraphs: string[]) => {
+  type TranslateResult = { translation: ParagraphPair[]; analysis: ArticleAnalysis; title?: { en: string; zh: string }; author?: { en: string; zh: string } };
+
+  const translateAndAnalyzeStream = async (
+    paragraphs: string[],
+    onProgress: (p: { percent: number; step: string }) => void
+  ): Promise<TranslateResult> => {
+    const res = await fetch("/api/translate-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paragraphs }),
+    });
+
+    if (!res.ok || !res.body) {
+      throw new Error(`流式接口不可用 (${res.status})`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let msg: { type: string; percent?: number; step?: string; result?: TranslateResult; message?: string };
+        try {
+          msg = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        if (msg.type === "progress") {
+          onProgress({ percent: msg.percent ?? 0, step: msg.step ?? "" });
+        } else if (msg.type === "done") {
+          if (msg.result) return msg.result;
+          throw new Error("模型返回格式异常，请重试");
+        } else if (msg.type === "error") {
+          throw new Error(msg.message ?? "翻译失败");
+        }
+      }
+    }
+    throw new Error("模型返回格式异常，请重试");
+  };
+
+  const translateAndAnalyze = async (paragraphs: string[]): Promise<TranslateResult> => {
     let res: Response;
     try {
       res = await fetch("/api/translate", {
@@ -204,12 +254,14 @@ export default function App() {
     setAnalysis(null);
 
     try {
+      setProgress({ percent: 5, step: "正在解析文档..." });
       const arrayBuffer = await file.arrayBuffer();
       const mammothResult = await mammoth.extractRawText({ arrayBuffer });
       const text = mammothResult.value;
-      
+
+      setProgress({ percent: 15, step: "正在提取段落..." });
       const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
-      
+
       if (paragraphs.length === 0) {
         throw new Error("The document appears to be empty.");
       }
@@ -222,8 +274,24 @@ export default function App() {
         limitedParagraphs.push(p);
         total += p.length;
       }
-      const result = await translateAndAnalyze(limitedParagraphs);
+
+      let result: TranslateResult;
+      try {
+        result = await translateAndAnalyzeStream(limitedParagraphs, (p) => setProgress(p));
+      } catch (streamErr: unknown) {
+        let fallbackPercent = 20;
+        const fallbackTimer = setInterval(() => {
+          fallbackPercent = Math.min(fallbackPercent + 8, 85);
+          setProgress({ percent: fallbackPercent, step: "翻译中..." });
+        }, 1500);
+        try {
+          result = await translateAndAnalyze(limitedParagraphs);
+        } finally {
+          clearInterval(fallbackTimer);
+        }
+      }
       
+      setProgress({ percent: 95, step: "正在保存..." });
       const newTitle = { zh: (result.title?.zh || "").trim() || "—", en: (result.title?.en || "").trim() || "—" };
       const newAuthor = { zh: (result.author?.zh || "").trim() || "—", en: (result.author?.en || "").trim() || "—" };
       setContent(result.translation);
@@ -231,10 +299,12 @@ export default function App() {
       setTitle(newTitle);
       setAuthor(newAuthor);
       saveToHistory({ title: newTitle, author: newAuthor, content: result.translation, analysis: result.analysis });
+      setProgress({ percent: 100, step: "完成" });
     } catch (err: any) {
       setError(err.message || "An error occurred while processing the file.");
     } finally {
       setIsTranslating(false);
+      setProgress(null);
     }
   };
 
@@ -375,12 +445,24 @@ export default function App() {
 
         {/* Loading State */}
         {isTranslating && (
-          <div className="flex flex-col items-center justify-center py-32 space-y-8">
-            <div className="relative">
-              <div className="absolute inset-0 bg-vibrant-1 blur-2xl opacity-10 animate-pulse" />
-              <Loader2 className="w-16 h-16 animate-spin text-vibrant-1 relative z-10" />
+          <div className="flex flex-col items-center justify-center py-32 space-y-8 max-w-xl mx-auto">
+            <div className="relative w-full">
+              <Loader2 className="w-16 h-16 animate-spin text-ink/40 relative z-10 mx-auto mb-8 block" />
+              <div className="relative z-10 h-2 bg-ink/10 rounded-full overflow-hidden">
+                <motion.div
+                  className="h-full bg-ink/30 rounded-full"
+                  initial={{ width: 0 }}
+                  animate={{ width: `${progress?.percent ?? 0}%` }}
+                  transition={{ duration: 0.3, ease: "easeOut" }}
+                />
+              </div>
+              <p className="mt-4 font-sans text-sm text-ink/60 text-center">
+                {progress?.step ?? "处理中..."}
+              </p>
+              <p className="mt-1 font-sans text-xs text-ink/40 text-center">
+                {progress?.percent ?? 0}%
+              </p>
             </div>
-            <p className="font-sans text-xs uppercase tracking-[0.3em] font-bold text-ink/40">Analyzing and translating text...</p>
           </div>
         )}
 
