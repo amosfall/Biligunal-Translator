@@ -1,19 +1,11 @@
 import dotenv from 'dotenv';
 import express from 'express';
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { neon } from '@neondatabase/serverless';
 import JSON5 from 'json5';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEBUG_LOG = path.resolve(__dirname, '..', '.cursor', 'debug-ccdb89.log');
-const dlog = (loc: string, msg: string, data: object, h?: string) => {
-  try {
-    fs.mkdirSync(path.dirname(DEBUG_LOG), { recursive: true });
-    fs.appendFileSync(DEBUG_LOG, JSON.stringify({ sessionId: 'ccdb89', location: loc, message: msg, data, hypothesisId: h, timestamp: Date.now() }) + '\n');
-  } catch {}
-};
 const root = path.resolve(__dirname);
 const cwd = process.cwd();
 // 从多个可能位置加载 .env.local（npm 启动时 cwd 为 bilingual-editorial）
@@ -285,28 +277,14 @@ const TABLE_SQL = `CREATE TABLE IF NOT EXISTS translations (
   analysis JSONB
 )`;
 
-function getDbHost(url: string): string {
-  try { return (url.match(/@([^/?:]+)/) || [])[1] || 'unknown'; } catch { return 'unknown'; }
-}
-
 async function withHistoryDb<T>(fn: (sql: ReturnType<typeof neon>) => Promise<T>): Promise<T | null> {
   const url = (process.env.DATABASE_URL || '').trim();
-  // #region agent log
-  dlog('server.ts:withHistoryDb', 'db check', { hasUrl: !!url, host: url ? getDbHost(url) : '' }, 'H1');
-  // #endregion
   if (!url) return null;
   try {
     const sql = neon(url);
     await sql.query(TABLE_SQL);
-    const out = await fn(sql);
-    // #region agent log
-    dlog('server.ts:withHistoryDb', 'db ok', { host: getDbHost(url) }, 'H2');
-    // #endregion
-    return out;
-  } catch (e) {
-    // #region agent log
-    dlog('server.ts:withHistoryDb', 'db error', { err: String(e) }, 'H2');
-    // #endregion
+    return await fn(sql);
+  } catch {
     return null;
   }
 }
@@ -330,9 +308,6 @@ app.get('/api/history', async (_req, res) => {
 });
 
 app.post('/api/history', async (req, res) => {
-  // #region agent log
-  dlog('server.ts:POST /api/history', 'history save request', { contentLen: req.body?.content?.length }, 'H3');
-  // #endregion
   const body = req.body as { id?: string; createdAt?: number; title?: { zh: string; en: string }; author?: { zh: string; en: string }; content?: { en: string; zh: string }[]; analysis?: Record<string, unknown> | null };
   const id = (body?.id || crypto.randomUUID()) as string;
   const createdAt = typeof body?.createdAt === 'number' ? body.createdAt : Date.now();
@@ -342,16 +317,19 @@ app.post('/api/history', async (req, res) => {
   const analysis = body?.analysis ?? null;
   if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
+  const contentStr = JSON.stringify(content);
+  const analysisStr = analysis ? JSON.stringify(analysis) : null;
   const ok = await withHistoryDb(async (sql) => {
-    await sql`INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis)
-      VALUES (${id}, ${createdAt}, ${title.zh ?? ''}, ${title.en ?? ''}, ${author.zh ?? ''}, ${author.en ?? ''}, ${content}, ${analysis})
-      ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
-        author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis`;
+    // 使用 JSON.stringify + 无显式 cast，由列类型隐式转换为 JSONB（node-pg 推荐做法）
+    await sql.query(
+      `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
+         author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis`,
+      [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr]
+    );
     return true;
   });
-  // #region agent log
-  dlog('server.ts:POST /api/history', 'history save result', { ok: ok !== null }, 'H3');
-  // #endregion
   if (ok === null) return res.status(503).json({ error: '历史同步未配置。' });
   return res.json({ id, createdAt });
 });
@@ -370,10 +348,6 @@ app.delete('/api/history', async (req, res) => {
 app.listen(PORT, () => {
   const raw = (process.env.DEEPSEEK_API_KEY || '').trim();
   const hasKey = raw && !['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'].some(p => raw.includes(p));
-  const dbUrl = (process.env.DATABASE_URL || '').trim();
-  // #region agent log
-  dlog('server.ts:listen', 'server start', { hasDb: !!dbUrl, dbHost: dbUrl ? getDbHost(dbUrl) : '' }, 'H1');
-  // #endregion
   console.log(`Translator API running at http://localhost:${PORT}`);
   if (!hasKey) {
     console.warn('⚠️  DEEPSEEK_API_KEY 未配置，翻译请求将失败。请创建 bilingual-editorial/.env.local 并填写密钥。');

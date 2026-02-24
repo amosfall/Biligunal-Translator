@@ -67,10 +67,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
     const ok = await withHistoryDb(async (sql) => {
-      await sql`INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis)
-        VALUES (${id}, ${createdAt}, ${title.zh ?? ''}, ${title.en ?? ''}, ${author.zh ?? ''}, ${author.en ?? ''}, ${content}, ${analysis})
-        ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
-          author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis`;
+      // 使用 JSON.stringify + 无显式 cast，由列类型隐式转换为 JSONB
+      const contentStr = JSON.stringify(content);
+      const analysisStr = analysis ? JSON.stringify(analysis) : null;
+      await sql.query(
+        `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
+           author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis`,
+        [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr]
+      );
       return true;
     });
     if (ok === null) return res.status(503).json({ error: '历史同步未配置。' });
