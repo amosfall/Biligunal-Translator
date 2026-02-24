@@ -7,6 +7,7 @@ import { useState, useRef, useEffect, ChangeEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { BookOpen, Share2, Bookmark, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2 } from "lucide-react";
 import mammoth from "mammoth";
+import JSON5 from "json5";
 
 interface ParagraphPair {
   en: string;
@@ -64,13 +65,54 @@ export default function App() {
     try {
       const raw = localStorage.getItem(HISTORY_KEY);
       if (!raw) return [];
-      const parsed = JSON.parse(raw) as HistoryItem[];
-      return Array.isArray(parsed) ? parsed.slice(0, MAX_HISTORY) : [];
+      if (raw.length > 25000) {
+        try { localStorage.removeItem(HISTORY_KEY); } catch {}
+        return [];
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        try { parsed = JSON5.parse(raw); } catch {
+          try { localStorage.removeItem(HISTORY_KEY); } catch {}
+          return [];
+        }
+      }
+      if (!Array.isArray(parsed)) {
+        try { localStorage.removeItem(HISTORY_KEY); } catch {}
+        return [];
+      }
+      const valid = parsed.filter((it: unknown) => it && typeof it === 'object' && Array.isArray((it as HistoryItem).content));
+      if (valid.length !== parsed.length) {
+        try { localStorage.removeItem(HISTORY_KEY); } catch {}
+        return [];
+      }
+      return valid.slice(0, MAX_HISTORY) as HistoryItem[];
     } catch {
+      try { localStorage.removeItem(HISTORY_KEY); } catch {}
       return [];
     }
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 从云端拉取历史（多设备同步），失败则继续用 localStorage
+  useEffect(() => {
+    fetch("/api/history")
+      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
+      .then((text) => {
+        try { return JSON.parse(text); } catch { return JSON5.parse(text); }
+      })
+      .then((items: HistoryItem[]) => {
+        if (Array.isArray(items) && items.length > 0) {
+          const sliced = items.slice(0, MAX_HISTORY);
+          setHistory(sliced);
+          try {
+            localStorage.setItem(HISTORY_KEY, JSON.stringify(sliced));
+          } catch {}
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     try {
@@ -81,12 +123,17 @@ export default function App() {
   }, [history]);
 
   const saveToHistory = (item: Omit<HistoryItem, "id" | "createdAt">) => {
-    const entry: HistoryItem = {
-      ...item,
-      id: crypto.randomUUID(),
-      createdAt: Date.now(),
-    };
-    setHistory(prev => [entry, ...prev.slice(0, MAX_HISTORY - 1)]);
+    const id = crypto.randomUUID();
+    const createdAt = Date.now();
+    const entry: HistoryItem = { ...item, id, createdAt };
+    setHistory((prev) => [entry, ...prev.slice(0, MAX_HISTORY - 1)]);
+
+    // 异步同步到云端
+    fetch("/api/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...item, id, createdAt }),
+    }).catch(() => {});
   };
 
   const loadFromHistory = (item: HistoryItem) => {
@@ -99,7 +146,10 @@ export default function App() {
 
   const removeFromHistory = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setHistory(prev => prev.filter(h => h.id !== id));
+    setHistory((prev) => prev.filter((h) => h.id !== id));
+
+    // 异步从云端删除
+    fetch(`/api/history?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
   };
 
   const translateAndAnalyze = async (paragraphs: string[]) => {
@@ -129,12 +179,13 @@ export default function App() {
       throw new Error(serverMsg || `翻译服务调用失败 (${res.status})`);
     }
 
-    const result = JSON.parse(await res.text()) as {
-      translation: ParagraphPair[];
-      analysis: ArticleAnalysis;
-      title?: { en: string; zh: string };
-      author?: { en: string; zh: string };
-    };
+    const text = await res.text();
+    let result: { translation: ParagraphPair[]; analysis: ArticleAnalysis; title?: { en: string; zh: string }; author?: { en: string; zh: string } };
+    try { result = JSON.parse(text); } catch {
+      try { result = JSON5.parse(text); } catch {
+        throw new Error('模型返回格式异常，请重试');
+      }
+    }
     return result;
   };
 
@@ -162,7 +213,7 @@ export default function App() {
         throw new Error("The document appears to be empty.");
       }
 
-      const MAX_CHARS = 20000;
+      const MAX_CHARS = 30000;
       const limitedParagraphs: string[] = [];
       let total = 0;
       for (const p of paragraphs) {

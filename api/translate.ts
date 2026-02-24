@@ -1,4 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import JSON5 from 'json5';
 
 function extractTitleAuthorFromTranslation(
   translation: { en: string; zh: string }[]
@@ -108,6 +109,7 @@ ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
           { role: 'user', content: prompt },
         ],
         response_format: { type: 'json_object' },
+        max_tokens: 8192,
       }),
     });
 
@@ -126,12 +128,25 @@ ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 
     const data = await response.json();
     let content = data.choices?.[0]?.message?.content ?? '';
+
+    /** 修复 LLM 常见 JSON 格式问题（如数组/对象尾逗号） */
+    const sanitizeJson = (s: string) => s.replace(/,(\s*[\]}])/g, '$1');
+
     let json: { translation?: unknown[]; title?: { en: string; zh: string }; author?: { en: string; zh: string } };
     try {
       json = JSON.parse(content || '{}');
-    } catch {
-      const m = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/);
-      json = m ? JSON.parse(m[1] ?? m[0]) : {};
+    } catch (parseErr) {
+      try {
+        json = JSON.parse(sanitizeJson(content));
+      } catch {
+        try {
+          json = JSON5.parse(content);
+        } catch {
+          const m = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/);
+          const extracted = m ? (m[1] ?? m[0]) : '{}';
+          try { json = JSON5.parse(extracted); } catch { json = {}; }
+        }
+      }
     }
     if (!Array.isArray(json?.translation)) {
       return res.status(500).json({ error: '模型返回格式异常，请重试' });

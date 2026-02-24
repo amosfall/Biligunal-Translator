@@ -34,10 +34,11 @@ View your app in AI Studio: https://ai.studio/apps/3ea876de-ced9-4b8d-ab51-350aa
 1. 将本仓库推送到 GitHub。
 2. 在 [Vercel](https://vercel.com) 中 **Import Project**，选择该仓库。
 3. 配置环境变量：在 **Settings → Environment Variables** 中添加 `DEEPSEEK_API_KEY`，值从 `.env.local` 复制。
-4. 构建设置（通常可自动识别）：
+4. **（可选）多设备历史同步**：在 Vercel 打开 **Storage** → 安装 [Neon Postgres](https://vercel.com/marketplace/neon) 集成 → 连接本项目。连接后 `DATABASE_URL` 会自动注入，历史翻译会在手机、平板、电脑间同步。
+5. 构建设置（通常可自动识别）：
    - **Framework Preset**: Vite
    - **Build Command**: `npm run build`
    - **Output Directory**: `dist`
-5. 点击 Deploy，完成后在手机/平板访问部署域名即可使用。
+6. 点击 Deploy，完成后在手机/平板访问部署域名即可使用。
 
 > 若 GitHub 仓库根目录是上一级（如 `Translator Project`），在 Vercel 导入时需将 **Root Directory** 设为 `bilingual-editorial`。
