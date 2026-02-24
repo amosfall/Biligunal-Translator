@@ -39,6 +39,16 @@ function extractTitleAuthorFromTranslation(
   return result;
 }
 
+function mergeZhWithParagraphs(paragraphs: string[], raw: unknown[]): { en: string; zh: string }[] {
+  return paragraphs.map((en, i) => {
+    const v = raw[i];
+    if (typeof v === 'string') return { en, zh: v };
+    if (v && typeof v === 'object' && 'zh' in (v as object)) return { en, zh: String((v as { zh?: string }).zh ?? '') };
+    if (v && typeof v === 'object' && 'en' in (v as object)) return { en: String((v as { en?: string }).en ?? en), zh: String((v as { zh?: string }).zh ?? '') };
+    return { en, zh: '' };
+  });
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -76,17 +86,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 - 可能出现在标题下方、文首或文末
 - 只提取作者姓名，去掉 "作者："、"Author:"、"By" 等前缀
 
-输出必须是严格的 JSON，结构如下（不要多余文字）：
+【字数上限】必须严格遵守，宁可精简不可超出：
+- summary：≤60 汉字
+- narrativeDetail：≤200 汉字
+- themes / pros / cons 每项：≤40 汉字
+如果内容不足以填满，请精简表述，不要超出上限。
+
+输出必须是严格的 JSON，结构如下（不要多余文字）。translation 仅返回中文翻译数组，顺序与输入段落一一对应，不要回显英文：
 {
   "title": { "en": "英文标题", "zh": "中文标题" },
   "author": { "en": "英文作者名", "zh": "中文作者名" },
-  "translation": [
-    { "en": "原英文段落1", "zh": "对应的中文翻译1" },
-    ...
-  ],
+  "translation": ["中文翻译1", "中文翻译2", "..."],
   "analysis": {
-    "summary": "一句话中文概括",
-    "narrativeDetail": "200-300字中文叙事分析，关注结构、手法与节奏。",
+    "summary": "一句话概括（≤60字）",
+    "narrativeDetail": "叙事分析（≤200字）",
     "themes": ["主题1", "主题2", "主题3"],
     "pros": ["优点1", "优点2", "优点3"],
     "cons": ["不足1", "不足2", "不足3"]
@@ -154,7 +167,8 @@ ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
     if (!json.title) json.title = { en: '', zh: '' };
     if (!json.author) json.author = { en: '', zh: '' };
 
-    const fallback = extractTitleAuthorFromTranslation(json.translation as { en: string; zh: string }[]);
+    const translation = mergeZhWithParagraphs(paragraphs, json.translation);
+    const fallback = extractTitleAuthorFromTranslation(translation);
     const isEmpty = (t: { en?: string; zh?: string }) => {
       const v = (t?.en?.trim() || t?.zh?.trim() || '').replace(/[—\-]/g, '');
       return !v;
@@ -166,7 +180,7 @@ ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
       json.author = fallback.author;
     }
 
-    return res.status(200).json(json);
+    return res.status(200).json({ ...json, translation });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
     return res.status(500).json({ error: msg });

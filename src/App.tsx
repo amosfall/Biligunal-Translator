@@ -65,7 +65,8 @@ export default function App() {
     try {
       const raw = localStorage.getItem(HISTORY_KEY);
       if (!raw) return [];
-      if (raw.length > 25000) {
+      // localStorage 一般支持 5–10MB，2MB 足够保存约 50 条翻译记录
+      if (raw.length > 2_000_000) {
         try { localStorage.removeItem(HISTORY_KEY); } catch {}
         return [];
       }
