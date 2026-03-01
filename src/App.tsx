@@ -3,23 +3,95 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useRef, useEffect, ChangeEvent } from "react";
+import React, { useState, useRef, useEffect, ChangeEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { BookOpen, Share2, Bookmark, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2 } from "lucide-react";
 import mammoth from "mammoth";
 import JSON5 from "json5";
+import * as pdfjsLib from "pdfjs-dist";
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url
+).toString();
+
+async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<string> {
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const pages: string[] = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    pages.push(content.items.map((it: any) => it.str ?? "").join(" "));
+  }
+  return pages.join("\n\n");
+}
+
+function detectLanguage(text: string): "zh" | "en" {
+  const cjk = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) ?? []).length;
+  const total = text.replace(/\s/g, "").length;
+  return total > 0 && cjk / total > 0.15 ? "zh" : "en";
+}
 
 interface ParagraphPair {
   en: string;
   zh: string;
 }
 
+interface AnalysisBilingual {
+  en: string;
+  zh: string;
+}
+
 interface ArticleAnalysis {
-  summary: string;
-  narrativeDetail: string;
-  themes: string[];
-  pros: string[];
-  cons: string[];
+  summary: AnalysisBilingual;
+  narrativeDetail: AnalysisBilingual;
+  themes: AnalysisBilingual[];
+  pros: AnalysisBilingual[];
+  cons: AnalysisBilingual[];
+}
+
+/** 规范化 analysis，兼容新的双语格式和旧的纯中文字符串格式 */
+function normalizeAnalysis(raw: unknown): ArticleAnalysis | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+
+  const toBilingual = (v: unknown): AnalysisBilingual => {
+    if (v && typeof v === 'object') {
+      const b = v as Record<string, unknown>;
+      if ('en' in b || 'zh' in b) {
+        return {
+          en: typeof b.en === 'string' ? b.en.trim() : '',
+          zh: typeof b.zh === 'string' ? b.zh.trim() : '',
+        };
+      }
+    }
+    // 向后兼容：旧格式为纯中文字符串
+    const s = typeof v === 'string' ? v.trim() : '';
+    return { en: '', zh: s };
+  };
+
+  const toArr = (v: unknown): AnalysisBilingual[] => {
+    if (!Array.isArray(v)) return [];
+    return v.map(item => toBilingual(item));
+  };
+
+  const summary = toBilingual(o.summary ?? o.Summary);
+  const narrativeDetail = toBilingual(o.narrativeDetail ?? (o as Record<string, unknown>).narrative_detail);
+  const themes = toArr(o.themes ?? o.Themes);
+  const pros = toArr(o.pros ?? o.Pros);
+  const cons = toArr(o.cons ?? o.Cons);
+
+  const hasContent = summary.en || summary.zh || narrativeDetail.en || narrativeDetail.zh ||
+    themes.length > 0 || pros.length > 0 || cons.length > 0;
+  if (!hasContent) return null;
+
+  const ph: AnalysisBilingual = { en: '—', zh: '—' };
+  return {
+    summary: (summary.en || summary.zh) ? summary : ph,
+    narrativeDetail: (narrativeDetail.en || narrativeDetail.zh) ? narrativeDetail : ph,
+    themes: themes.length ? themes : [ph],
+    pros: pros.length ? pros : [ph],
+    cons: cons.length ? cons : [ph],
+  };
 }
 
 interface HistoryItem {
@@ -46,13 +118,30 @@ const INITIAL_CONTENT: ParagraphPair[] = [
 ];
 
 const INITIAL_ANALYSIS: ArticleAnalysis = {
-  summary: "这是一封写给斯蒂芬的私人信件，通过对星空与艺术作品的观察，探讨了记忆、生命与表达的本质。",
-  narrativeDetail: "叙事采用了非线性的意识流手法。作者从当下的遛狗场景切入，通过“星星”这一意象自然过渡到对斯蒂芬艺术作品的评价。叙事重心不在于具体的事件，而在于意象的堆叠——从“喧嚣的头脑”到“星座般的词语”，再到一系列具体的、具有冲击力的视觉符号（带枪的小人、夜总会、发霉的香蕉）。这种叙事方式模拟了记忆的碎片化特征，将一个人的生命（A life）呈现为一张“漫长且散乱的夜晚”所构成的记忆地图。",
-  themes: ["记忆的碎片化与重构", "艺术表达的非人格化", "生命作为时空地图的隐喻"],
-  pros: ["意象高度浓缩且具有强烈的视觉感", "成功捕捉了意识流动的细腻质感", "深刻探讨了艺术与创作者之间的距离"],
-  cons: ["意象跳跃极快，初读可能产生断裂感", "对读者理解抽象隐喻的能力要求较高", "叙事结构松散，缺乏传统意义上的情节起伏"]
+  summary: {
+    en: "A personal letter exploring how memory, life, and artistic expression intertwine through stargazing and fragments of consciousness.",
+    zh: '这是一封写给斯蒂芬的私人信件，通过对星空与艺术作品的观察，探讨了记忆、生命与表达的本质。',
+  },
+  narrativeDetail: {
+    en: "The narrative employs non-linear stream of consciousness. Starting with the immediate scene of walking a dog, it transitions through the image of stars to an evaluation of Stephane's work. The focus is not on events but on the accumulation of imagery from the extreme head racket to constellation-like words, to visceral visual symbols (armed stick figures, nightclubs, rotting bananas). This mirrors the fragmentary nature of memory, presenting a life as a memory map of a long, scattered night.",
+    zh: '叙事采用了非线性的意识流手法。作者从当下的遗狗场景切入，通过“星星”这一意象自然过渡到对斯蒂芬艺术作品的评价。叙事重心不在于具体的事件，而在于意象的堆叠——从“喧囵的头脑”到“星座般的词语”，再到一系列具体的、具有冲击力的视觉符号。这种叙事方式模拟了记忆的碎片化特征，将一个人的生命呼现为一张“漫长且散乱的夜晚”所构成的记忆地图。',
+  },
+  themes: [
+    { en: "Fragmentation and reconstruction of memory", zh: "记忆的碎片化与重构" },
+    { en: "Depersonalization of artistic expression", zh: "艺术表达的非人格化" },
+    { en: "Life as a spatiotemporal map metaphor", zh: "生命作为时空地图的隐嗻" },
+  ],
+  pros: [
+    { en: "Imagery is highly condensed with strong visual resonance", zh: "意象高度浓缩且具有强烈的视觉感" },
+    { en: "Successfully captures the delicate texture of flowing consciousness", zh: "成功捕捉了意识流动的细腊质感" },
+    { en: "Profoundly explores the distance between art and its creator", zh: "深刻探讨了艺术与创作者之间的距离" },
+  ],
+  cons: [
+    { en: "Imagery shifts so rapidly that initial reading may feel disconnected", zh: "意象跳跃极快，初读可能产生断裂感" },
+    { en: "Demands a reader comfortable with abstract metaphor", zh: "对读者理解抽象隐嗻的能力要求较高" },
+    { en: "Loose structure lacks conventional narrative tension", zh: "叙事结构松散，缺乏传统意义上的情节起伏" },
+  ],
 };
-
 export default function App() {
   const [content, setContent] = useState<ParagraphPair[]>(INITIAL_CONTENT);
   const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(INITIAL_ANALYSIS);
@@ -140,7 +229,7 @@ export default function App() {
 
   const loadFromHistory = (item: HistoryItem) => {
     setContent(item.content);
-    setAnalysis(item.analysis);
+    setAnalysis(normalizeAnalysis(item.analysis) ?? item.analysis ?? null);
     setTitle(item.title);
     setAuthor(item.author);
     setHistoryOpen(false);
@@ -158,12 +247,13 @@ export default function App() {
 
   const translateAndAnalyzeStream = async (
     paragraphs: string[],
-    onProgress: (p: { percent: number; step: string }) => void
+    onProgress: (p: { percent: number; step: string }) => void,
+    sourceLang: "en" | "zh" = "en"
   ): Promise<TranslateResult> => {
     const res = await fetch("/api/translate-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paragraphs }),
+      body: JSON.stringify({ paragraphs, sourceLang }),
     });
 
     if (!res.ok || !res.body) {
@@ -203,13 +293,13 @@ export default function App() {
     throw new Error("模型返回格式异常，请重试");
   };
 
-  const translateAndAnalyze = async (paragraphs: string[]): Promise<TranslateResult> => {
+  const translateAndAnalyze = async (paragraphs: string[], sourceLang: "en" | "zh" = "en"): Promise<TranslateResult> => {
     let res: Response;
     try {
       res = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ paragraphs }),
+        body: JSON.stringify({ paragraphs, sourceLang }),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -224,7 +314,8 @@ export default function App() {
       let data: { error?: string; detail?: string } = {};
       try { data = text ? JSON.parse(text) : {}; } catch {}
       const serverMsg = data.error || data.detail;
-      if (res.status === 502 || res.status === 504) {
+      // 502/504 是代理错误，500 且无 JSON body 通常也是 Vite 代理连接失败（ECONNREFUSED）
+      if (res.status === 502 || res.status === 504 || (res.status === 500 && !serverMsg)) {
         throw new Error("翻译服务未启动。请先在另一终端运行：npm run server");
       }
       throw new Error(serverMsg || `翻译服务调用失败 (${res.status})`);
@@ -244,8 +335,10 @@ export default function App() {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    if (!file.name.endsWith(".docx")) {
-      setError("Please upload a .docx file.");
+    const ext = file.name.split(".").pop()?.toLowerCase();
+
+    if (!["docx", "doc", "pdf"].includes(ext ?? "")) {
+      setError("请上传 .pdf、.docx 或 .doc 文件");
       return;
     }
 
@@ -255,12 +348,32 @@ export default function App() {
 
     try {
       setProgress({ percent: 5, step: "正在解析文档..." });
-      const arrayBuffer = await file.arrayBuffer();
-      const mammothResult = await mammoth.extractRawText({ arrayBuffer });
-      const text = mammothResult.value;
+
+      let text = "";
+      if (ext === "pdf") {
+        const arrayBuffer = await file.arrayBuffer();
+        text = await extractPdfText(arrayBuffer);
+      } else if (ext === "docx") {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        text = result.value;
+      } else {
+        // .doc —— 上传到服务器解析
+        const formData = new FormData();
+        formData.append("file", file);
+        const resp = await fetch("/api/extract-text", { method: "POST", body: formData });
+        if (!resp.ok) throw new Error("旧版 .doc 文件解析失败，建议另存为 .docx 后重试");
+        const data = await resp.json();
+        text = data.text;
+      }
 
       setProgress({ percent: 15, step: "正在提取段落..." });
-      const paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+      // 先按空行分段；若文档用单换行分段（Word 常见格式），则回退到按单行分段
+      let paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+      if (paragraphs.length <= 1 || paragraphs.some(p => p.length > 5000)) {
+        const byLines = text.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
+        if (byLines.length > paragraphs.length) paragraphs = byLines;
+      }
 
       if (paragraphs.length === 0) {
         throw new Error("The document appears to be empty.");
@@ -275,9 +388,11 @@ export default function App() {
         total += p.length;
       }
 
+      const sourceLang = detectLanguage(text);
+
       let result: TranslateResult;
       try {
-        result = await translateAndAnalyzeStream(limitedParagraphs, (p) => setProgress(p));
+        result = await translateAndAnalyzeStream(limitedParagraphs, (p) => setProgress(p), sourceLang);
       } catch (streamErr: unknown) {
         let fallbackPercent = 20;
         const fallbackTimer = setInterval(() => {
@@ -285,7 +400,7 @@ export default function App() {
           setProgress({ percent: fallbackPercent, step: "翻译中..." });
         }, 1500);
         try {
-          result = await translateAndAnalyze(limitedParagraphs);
+          result = await translateAndAnalyze(limitedParagraphs, sourceLang);
         } finally {
           clearInterval(fallbackTimer);
         }
@@ -295,7 +410,7 @@ export default function App() {
       const newTitle = { zh: (result.title?.zh || "").trim() || "—", en: (result.title?.en || "").trim() || "—" };
       const newAuthor = { zh: (result.author?.zh || "").trim() || "—", en: (result.author?.en || "").trim() || "—" };
       setContent(result.translation);
-      setAnalysis(result.analysis);
+      setAnalysis(normalizeAnalysis(result.analysis) ?? result.analysis ?? null);
       setTitle(newTitle);
       setAuthor(newAuthor);
       saveToHistory({ title: newTitle, author: newAuthor, content: result.translation, analysis: result.analysis });
@@ -337,7 +452,7 @@ export default function App() {
               type="file" 
               ref={fileInputRef} 
               onChange={handleFileUpload} 
-              accept=".docx" 
+              accept=".docx,.doc,.pdf"
               className="hidden" 
             />
           </div>
@@ -432,12 +547,12 @@ export default function App() {
               className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24"
             >
               <div className="space-y-6">
-                <h2 className="book-title-zh whitespace-pre-line">{title.zh}</h2>
-                <p className="text-xl font-serif-zh opacity-60 tracking-widest">{author.zh}</p>
-              </div>
-              <div className="space-y-6">
                 <h2 className="book-title-en whitespace-pre-line">{title.en}</h2>
                 <p className="text-xl font-serif opacity-60 italic">{author.en}</p>
+              </div>
+              <div className="space-y-6">
+                <h2 className="book-title-zh whitespace-pre-line">{title.zh}</h2>
+                <p className="text-xl font-serif-zh opacity-60 tracking-widest">{author.zh}</p>
               </div>
             </motion.div>
           </header>
@@ -479,14 +594,14 @@ export default function App() {
                   transition={{ duration: 1.5, ease: [0.22, 1, 0.36, 1] }}
                   className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 items-start"
                 >
-                  {/* Chinese Side */}
-                  <div className="content-text content-text-zh whitespace-pre-wrap">
-                    {pair.zh}
-                  </div>
-
                   {/* English Side */}
                   <div className="content-text whitespace-pre-wrap text-ink/80">
                     {pair.en}
+                  </div>
+
+                  {/* Chinese Side */}
+                  <div className="content-text content-text-zh whitespace-pre-wrap">
+                    {pair.zh}
                   </div>
                 </motion.div>
               ))}
@@ -504,30 +619,42 @@ export default function App() {
                 <div className="absolute top-0 right-0 w-96 h-96 bg-vibrant-1/5 blur-[100px] rounded-full -mr-48 -mt-48" />
                 
                 <div className="space-y-20 relative z-10">
-                  {/* Summary & Narrative Detail */}
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-16">
-                    <div className="lg:col-span-1">
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-6 font-bold opacity-40">Overview / 概览</h3>
-                      <p className="text-xl md:text-2xl font-serif-zh leading-relaxed italic text-ink/90">
-                        “{analysis.summary}”
+                  {/* Overview */}
+                  <div>
+                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Overview / 概览</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24">
+                      <p className="text-xl md:text-2xl font-serif leading-relaxed italic text-ink/90">
+                        "{analysis.summary.en}"
                       </p>
-                      
-                      <div className="mt-12">
-                        <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-6 font-bold opacity-40">Key Themes / 核心主题</h3>
-                        <div className="flex flex-wrap gap-2">
-                          {analysis.themes.map((theme, i) => (
-                            <span key={i} className="px-3 py-1 rounded-full bg-ink/5 text-[10px] font-sans font-bold uppercase tracking-wider opacity-60">
-                              {theme}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
+                      <p className="text-xl md:text-2xl font-serif-zh leading-relaxed italic text-ink/90">
+                        "{analysis.summary.zh}"
+                      </p>
                     </div>
+                  </div>
 
-                    <div className="lg:col-span-2">
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-6 font-bold opacity-40">Narrative Analysis / 叙事深度解析</h3>
-                      <div className="text-lg md:text-xl font-serif-zh leading-[1.8] text-ink/80 space-y-4">
-                        {analysis.narrativeDetail.split('\n').map((para, i) => (
+                  {/* Key Themes */}
+                  <div>
+                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-6 font-bold opacity-40">Key Themes / 核心主题</h3>
+                    <div className="flex flex-wrap gap-2">
+                      {analysis.themes.map((theme, i) => (
+                        <span key={i} className="px-3 py-1.5 rounded-full bg-ink/5 text-[10px] font-sans font-bold uppercase tracking-wider opacity-60">
+                          {[theme.en, theme.zh].filter(Boolean).join(' / ')}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Narrative Analysis */}
+                  <div>
+                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Narrative Analysis / 叙事深度解析</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24">
+                      <div className="text-base md:text-lg font-serif leading-[1.8] text-ink/70 space-y-4 italic">
+                        {analysis.narrativeDetail.en.split('\n').map((para, i) => (
+                          <p key={i}>{para}</p>
+                        ))}
+                      </div>
+                      <div className="text-base md:text-lg font-serif-zh leading-[1.8] text-ink/80 space-y-4">
+                        {analysis.narrativeDetail.zh.split('\n').map((para, i) => (
                           <p key={i}>{para}</p>
                         ))}
                       </div>
@@ -538,11 +665,14 @@ export default function App() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-16 pt-16 border-t border-ink/5">
                     <div>
                       <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold text-vibrant-1">Strengths / 写作优点</h3>
-                      <ul className="space-y-6 font-serif-zh">
+                      <ul className="space-y-6">
                         {analysis.pros.map((pro, i) => (
                           <li key={i} className="flex items-start gap-4 group">
                             <span className="text-[10px] mt-2 font-sans font-bold text-vibrant-1/30 group-hover:text-vibrant-1 transition-colors">0{i+1}</span>
-                            <span className="text-lg opacity-80">{pro}</span>
+                            <div>
+                              {pro.en && <p className="text-sm font-serif italic text-ink/50 mb-1">{pro.en}</p>}
+                              {pro.zh && <p className="text-lg font-serif-zh text-ink/80">{pro.zh}</p>}
+                            </div>
                           </li>
                         ))}
                       </ul>
@@ -550,11 +680,14 @@ export default function App() {
 
                     <div>
                       <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold text-vibrant-2">Critique / 写作缺点</h3>
-                      <ul className="space-y-6 font-serif-zh">
+                      <ul className="space-y-6">
                         {analysis.cons.map((con, i) => (
                           <li key={i} className="flex items-start gap-4 group">
                             <span className="text-[10px] mt-2 font-sans font-bold text-vibrant-2/30 group-hover:text-vibrant-2 transition-colors">0{i+1}</span>
-                            <span className="text-lg opacity-80">{con}</span>
+                            <div>
+                              {con.en && <p className="text-sm font-serif italic text-ink/50 mb-1">{con.en}</p>}
+                              {con.zh && <p className="text-lg font-serif-zh text-ink/80">{con.zh}</p>}
+                            </div>
                           </li>
                         ))}
                       </ul>

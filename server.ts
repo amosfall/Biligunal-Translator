@@ -4,6 +4,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { neon } from '@neondatabase/serverless';
 import JSON5 from 'json5';
+import multer from 'multer';
+import { OfficeParser as officeParser } from 'officeparser';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname);
@@ -19,13 +21,15 @@ dotenv.config({ path: path.join(cwd, '..', '.env.local'), override: true });
 const app = express();
 app.use(express.json());
 
+// CORS：允许 localhost、127.0.0.1、局域网 IP，避免用不同地址访问时翻译失败
+const allowOrigin = (origin: string | undefined): string => {
+  if (!origin) return 'http://localhost:3000';
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
+  if (/^https?:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(origin)) return origin;
+  return 'http://localhost:3000';
+};
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', 'http://localhost:3000');
-  }
+  res.header('Access-Control-Allow-Origin', allowOrigin(req.headers.origin));
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
@@ -163,17 +167,18 @@ function buildFullPrompt(paragraphs: string[]): string {
 - themes / pros / cons 每项：≤40 汉字
 如果内容不足以填满，请精简表述，不要超出上限。
 
-输出必须是严格的 JSON，结构如下（不要多余文字）。translation 仅返回中文翻译数组，顺序与输入段落一一对应，不要回显英文：
+输出必须是严格的 JSON，结构如下（不要多余文字）。translation 仅返回中文翻译数组，顺序与输入段落一一对应，不要回显英文。
+【重要】analysis 为必填项，每个字段均需提供 en（英文）和 zh（中文）两个版本。
 {
   "title": { "en": "英文标题", "zh": "中文标题" },
   "author": { "en": "英文作者名", "zh": "中文作者名" },
   "translation": ["中文翻译1", "中文翻译2", "..."],
   "analysis": {
-    "summary": "一句话概括（≤60字）",
-    "narrativeDetail": "叙事分析（≤200字）",
-    "themes": ["主题1", "主题2", "主题3"],
-    "pros": ["优点1", "优点2", "优点3"],
-    "cons": ["不足1", "不足2", "不足3"]
+    "summary": { "en": "one-sentence summary (≤60 words)", "zh": "一句话概括（≤60字）" },
+    "narrativeDetail": { "en": "narrative analysis (≤200 words)", "zh": "叙事分析（≤200字）" },
+    "themes": [{ "en": "theme in English", "zh": "中文主题" }],
+    "pros": [{ "en": "strength in English", "zh": "中文优点" }],
+    "cons": [{ "en": "weakness in English", "zh": "中文不足" }]
   }
 }
 
@@ -191,15 +196,116 @@ function buildTranslationOnlyPrompt(paragraphs: string[]): string {
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-function mergeZhWithParagraphs(paragraphs: string[], raw: unknown[]): { en: string; zh: string }[] {
-  return paragraphs.map((en, i) => {
+function buildZhToEnFullPrompt(paragraphs: string[]): string {
+  return `你是一个专业的中英双语文学编辑。
+
+请你将下面的中文段落翻译为流畅的英文，并给出结构化的写作分析。
+同时从正文中识别并提取文章标题和作者。
+
+【字数上限】summary≤60字，narrativeDetail≤200字，其余每项≤40字
+
+输出严格 JSON，translation 仅返回英文翻译数组，顺序与输入一一对应，不要回显中文。analysis 每字段均需提供 en 和 zh 两个版本。
+{
+  "title": { "en": "...", "zh": "..." },
+  "author": { "en": "...", "zh": "..." },
+  "translation": ["English 1", "English 2", "..."],
+  "analysis": {
+    "summary": { "en": "one-sentence summary (≤60 words)", "zh": "一句话概括（≤60字）" },
+    "narrativeDetail": { "en": "narrative analysis (≤200 words)", "zh": "叙事分析（≤200字）" },
+    "themes": [{ "en": "theme in English", "zh": "中文主题" }],
+    "pros": [{ "en": "strength in English", "zh": "中文优点" }],
+    "cons": [{ "en": "weakness in English", "zh": "中文不足" }]
+  }
+}
+
+待翻译的中文段落：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildZhToEnTranslationOnlyPrompt(paragraphs: string[]): string {
+  return `将以下中文段落翻译为英文，仅输出 JSON，translation 为英文数组，顺序对应，不要回显中文：
+{ "translation": ["English 1", "..."] }
+
+段落：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+type BilingualStr = { en: string; zh: string };
+type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[] };
+
+/** 规范化模型返回的 analysis，支持双语对象和旧版纯字符串 */
+function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+
+  const toBilingual = (v: unknown): BilingualStr => {
+    if (v && typeof v === 'object') {
+      const b = v as Record<string, unknown>;
+      if ('en' in b || 'zh' in b) {
+        return { en: typeof b.en === 'string' ? b.en.trim() : '', zh: typeof b.zh === 'string' ? b.zh.trim() : '' };
+      }
+    }
+    const s = typeof v === 'string' ? v.trim() : '';
+    return { en: '', zh: s };
+  };
+
+  const toArr = (v: unknown): BilingualStr[] => {
+    if (!Array.isArray(v)) return [];
+    return v.map(item => toBilingual(item));
+  };
+
+  const summary = toBilingual(o.summary ?? o.Summary);
+  const narrativeDetail = toBilingual(o.narrativeDetail ?? o.narrative_detail);
+  const themes = toArr(o.themes ?? o.Themes);
+  const pros = toArr(o.pros ?? o.Pros);
+  const cons = toArr(o.cons ?? o.Cons);
+
+  const hasContent = summary.en || summary.zh || narrativeDetail.en || narrativeDetail.zh ||
+    themes.length > 0 || pros.length > 0 || cons.length > 0;
+  if (!hasContent) return null;
+
+  const ph: BilingualStr = { en: '—', zh: '—' };
+  return {
+    summary: (summary.en || summary.zh) ? summary : ph,
+    narrativeDetail: (narrativeDetail.en || narrativeDetail.zh) ? narrativeDetail : ph,
+    themes: themes.length ? themes : [ph],
+    pros: pros.length ? pros : [ph],
+    cons: cons.length ? cons : [ph],
+  };
+}
+
+function mergeTranslation(
+  sourceParagraphs: string[],
+  raw: unknown[],
+  sourceLang: 'en' | 'zh'
+): { en: string; zh: string }[] {
+  return sourceParagraphs.map((src, i) => {
     const v = raw[i];
-    if (typeof v === 'string') return { en, zh: v };
-    if (v && typeof v === 'object' && 'zh' in (v as object)) return { en, zh: String((v as { zh?: string }).zh ?? '') };
-    if (v && typeof v === 'object' && 'en' in (v as object)) return { en: String((v as { en?: string }).en ?? en), zh: String((v as { zh?: string }).zh ?? '') };
-    return { en, zh: '' };
+    let translated = '';
+    if (typeof v === 'string') {
+      translated = v;
+    } else if (v && typeof v === 'object') {
+      const key = sourceLang === 'zh' ? 'en' : 'zh';
+      translated = String((v as Record<string, unknown>)[key] ?? '');
+    }
+    return sourceLang === 'zh'
+      ? { en: translated, zh: src }
+      : { en: src, zh: translated };
   });
 }
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+app.post('/api/extract-text', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: '未收到文件' });
+  try {
+    const ast = await officeParser.parseOffice(req.file!.buffer);
+    const text = ast.toText();
+    return res.json({ text });
+  } catch (e) {
+    return res.status(500).json({ error: '文件解析失败，请确认文件完整' });
+  }
+});
 
 app.post('/api/translate', async (req, res) => {
   const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
@@ -211,32 +317,35 @@ app.post('/api/translate', async (req, res) => {
   }
 
   try {
-    const { paragraphs } = req.body as { paragraphs: string[] };
+    const { paragraphs, sourceLang = 'en' } = req.body as { paragraphs: string[]; sourceLang?: 'en' | 'zh' };
 
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
     }
 
+    const fullPrompt = sourceLang === 'zh' ? buildZhToEnFullPrompt : buildFullPrompt;
+    const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
+
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
 
     // 第一块：完整 prompt（含标题/作者/分析）
-    const firstJson = await callDeepSeek(buildFullPrompt(chunks[0]), DEEPSEEK_API_KEY);
+    const firstJson = await callDeepSeek(fullPrompt(chunks[0]), DEEPSEEK_API_KEY);
     if (!Array.isArray(firstJson?.translation)) {
       return res.status(500).json({ error: '模型返回格式异常，请重试' });
     }
 
-    const allTranslations = mergeZhWithParagraphs(chunks[0], firstJson.translation as unknown[]);
+    const allTranslations = mergeTranslation(chunks[0], firstJson.translation as unknown[], sourceLang);
 
     // 后续块：仅翻译，并行调用以缩短总等待时间
     const restChunks = chunks.slice(1);
     if (restChunks.length > 0) {
       const restResults = await Promise.all(
-        restChunks.map((chunk) => callDeepSeek(buildTranslationOnlyPrompt(chunk), DEEPSEEK_API_KEY))
+        restChunks.map((chunk) => callDeepSeek(transOnlyPrompt(chunk), DEEPSEEK_API_KEY))
       );
       for (let i = 0; i < restChunks.length; i++) {
         const chunkJson = restResults[i];
         if (Array.isArray(chunkJson?.translation)) {
-          allTranslations.push(...mergeZhWithParagraphs(restChunks[i], chunkJson.translation as unknown[]));
+          allTranslations.push(...mergeTranslation(restChunks[i], chunkJson.translation as unknown[], sourceLang));
         }
       }
     }
@@ -257,7 +366,8 @@ app.post('/api/translate', async (req, res) => {
       firstJson.author = fallback.author;
     }
 
-    return res.json({ ...firstJson, translation: allTranslations });
+    const analysis = normalizeAnalysis(firstJson.analysis);
+    return res.json({ ...firstJson, translation: allTranslations, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
     console.error(err);
@@ -282,7 +392,7 @@ app.post('/api/translate-stream', async (req, res) => {
   };
 
   try {
-    const { paragraphs } = req.body as { paragraphs: string[] };
+    const { paragraphs, sourceLang = 'en' } = req.body as { paragraphs: string[]; sourceLang?: 'en' | 'zh' };
 
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
@@ -293,6 +403,9 @@ app.post('/api/translate-stream', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
+    const fullPrompt = sourceLang === 'zh' ? buildZhToEnFullPrompt : buildFullPrompt;
+    const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
+
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
     const total = chunks.length;
     const allTranslations: { en: string; zh: string }[] = [];
@@ -301,21 +414,21 @@ app.post('/api/translate-stream', async (req, res) => {
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
 
     // 第一块：完整 prompt（含标题/作者/分析）
-    const fj = await callDeepSeek(buildFullPrompt(chunks[0]), DEEPSEEK_API_KEY);
+    const fj = await callDeepSeek(fullPrompt(chunks[0]), DEEPSEEK_API_KEY);
     if (!Array.isArray(fj?.translation)) {
       write({ type: 'error', message: '模型返回格式异常，请重试' });
       return res.end();
     }
     firstJson = fj;
-    allTranslations.push(...mergeZhWithParagraphs(chunks[0], fj.translation as unknown[]));
+    allTranslations.push(...mergeTranslation(chunks[0], fj.translation as unknown[], sourceLang));
     const pct1 = Math.round((1 / total) * 100);
     write({ type: 'progress', chunk: 1, total, percent: pct1, step: `翻译第 1/${total} 段` });
 
     // 后续块：仅翻译，顺序调用以支持进度推送
     for (let i = 1; i < chunks.length; i++) {
-      const chunkJson = await callDeepSeek(buildTranslationOnlyPrompt(chunks[i]), DEEPSEEK_API_KEY);
+      const chunkJson = await callDeepSeek(transOnlyPrompt(chunks[i]), DEEPSEEK_API_KEY);
       if (Array.isArray(chunkJson?.translation)) {
-        allTranslations.push(...mergeZhWithParagraphs(chunks[i], chunkJson.translation as unknown[]));
+        allTranslations.push(...mergeTranslation(chunks[i], chunkJson.translation as unknown[], sourceLang));
       }
       const pct = Math.round(((i + 1) / total) * 100);
       write({ type: 'progress', chunk: i + 1, total, percent: pct, step: `翻译第 ${i + 1}/${total} 段` });
@@ -336,9 +449,10 @@ app.post('/api/translate-stream', async (req, res) => {
       firstJson.author = fallback.author;
     }
 
+    const analysis = normalizeAnalysis(firstJson.analysis);
     write({
       type: 'done',
-      result: { ...firstJson, translation: allTranslations }
+      result: { ...firstJson, translation: allTranslations, analysis }
     });
     res.end();
   } catch (err: unknown) {
