@@ -320,11 +320,14 @@ export default function App() {
       const serverMsg = data.error || data.detail;
       const h = typeof window !== "undefined" ? window.location?.hostname ?? "" : "";
       const isLocal = /^localhost$|^127\.0\.0\.1$/i.test(h) && !/vercel|netlify|cloudflarepages/i.test(h);
-      // 502/504 代理错误；500 且无 JSON body 通常为 Vite 代理连接失败（本地）或服务端异常（部署）
-      if (res.status === 502 || res.status === 504 || (res.status === 500 && !serverMsg)) {
+      // 504 = Vercel 函数超时，多发生在长文档
+      if (res.status === 504) {
+        throw new Error("翻译超时（文档过长）。请尝试上传较短文档（建议单次约 3000 字以内）或分批翻译。");
+      }
+      if (res.status === 502 || (res.status === 500 && !serverMsg)) {
         throw new Error(isLocal
           ? "翻译服务未启动。请先在另一终端运行：npm run server"
-          : "翻译服务暂时不可用，请稍后重试。若为 Vercel 部署，请在项目 Settings → Environment Variables 中配置 DEEPSEEK_API_KEY 并重新部署。");
+          : serverMsg || "翻译服务暂时不可用，请稍后重试。");
       }
       throw new Error(serverMsg || `翻译服务调用失败 (${res.status})`);
     }
