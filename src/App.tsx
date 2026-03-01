@@ -304,7 +304,11 @@ export default function App() {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (/fetch|network|failed/i.test(msg) || msg === "Load failed") {
-        throw new Error("无法连接翻译服务。请先在另一终端运行：npm run server");
+        const h = typeof window !== "undefined" ? window.location?.hostname ?? "" : "";
+        const isLocal = /^localhost$|^127\.0\.0\.1$/i.test(h) && !/vercel|netlify|cloudflarepages/i.test(h);
+        throw new Error(isLocal
+          ? "无法连接翻译服务。请先在另一终端运行：npm run server"
+          : "无法连接翻译服务，请检查网络或稍后重试。若为 Vercel 部署，请在项目设置中配置 DEEPSEEK_API_KEY 并重新部署。");
       }
       throw err;
     }
@@ -314,9 +318,13 @@ export default function App() {
       let data: { error?: string; detail?: string } = {};
       try { data = text ? JSON.parse(text) : {}; } catch {}
       const serverMsg = data.error || data.detail;
-      // 502/504 是代理错误，500 且无 JSON body 通常也是 Vite 代理连接失败（ECONNREFUSED）
+      const h = typeof window !== "undefined" ? window.location?.hostname ?? "" : "";
+      const isLocal = /^localhost$|^127\.0\.0\.1$/i.test(h) && !/vercel|netlify|cloudflarepages/i.test(h);
+      // 502/504 代理错误；500 且无 JSON body 通常为 Vite 代理连接失败（本地）或服务端异常（部署）
       if (res.status === 502 || res.status === 504 || (res.status === 500 && !serverMsg)) {
-        throw new Error("翻译服务未启动。请先在另一终端运行：npm run server");
+        throw new Error(isLocal
+          ? "翻译服务未启动。请先在另一终端运行：npm run server"
+          : "翻译服务暂时不可用，请稍后重试。若为 Vercel 部署，请在项目 Settings → Environment Variables 中配置 DEEPSEEK_API_KEY 并重新部署。");
       }
       throw new Error(serverMsg || `翻译服务调用失败 (${res.status})`);
     }
