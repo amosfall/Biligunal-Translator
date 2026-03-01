@@ -248,7 +248,8 @@ export default function App() {
   const translateAndAnalyzeStream = async (
     paragraphs: string[],
     onProgress: (p: { percent: number; step: string }) => void,
-    sourceLang: "en" | "zh" = "en"
+    sourceLang: "en" | "zh" = "en",
+    onChunkDone?: (partial: { pairs: ParagraphPair[]; chunkIndex: number; title?: { en: string; zh: string }; author?: { en: string; zh: string }; analysis?: ArticleAnalysis | null }) => void
   ): Promise<TranslateResult> => {
     const res = await fetch("/api/translate-stream", {
       method: "POST",
@@ -274,7 +275,7 @@ export default function App() {
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let msg: { type: string; percent?: number; step?: string; result?: TranslateResult; message?: string };
+        let msg: { type: string; percent?: number; step?: string; result?: TranslateResult; message?: string; chunkIndex?: number; pairs?: ParagraphPair[]; title?: { en: string; zh: string }; author?: { en: string; zh: string }; analysis?: ArticleAnalysis | null };
         try {
           msg = JSON.parse(trimmed);
         } catch {
@@ -282,6 +283,14 @@ export default function App() {
         }
         if (msg.type === "progress") {
           onProgress({ percent: msg.percent ?? 0, step: msg.step ?? "" });
+        } else if (msg.type === "chunk_done" && onChunkDone && msg.pairs) {
+          onChunkDone({
+            pairs: msg.pairs,
+            chunkIndex: msg.chunkIndex ?? 0,
+            title: msg.title,
+            author: msg.author,
+            analysis: msg.analysis ?? null,
+          });
         } else if (msg.type === "done") {
           if (msg.result) return msg.result;
           throw new Error("模型返回格式异常，请重试");
@@ -401,9 +410,25 @@ export default function App() {
 
       const sourceLang = detectLanguage(text);
 
+      setContent([]);
+
       let result: TranslateResult;
       try {
-        result = await translateAndAnalyzeStream(limitedParagraphs, (p) => setProgress(p), sourceLang);
+        result = await translateAndAnalyzeStream(
+          limitedParagraphs,
+          (p) => setProgress(p),
+          sourceLang,
+          (partial) => {
+            if (partial.chunkIndex === 1) {
+              setContent(partial.pairs);
+              if (partial.title) setTitle({ zh: partial.title.zh || "—", en: partial.title.en || "—" });
+              if (partial.author) setAuthor({ zh: partial.author.zh || "—", en: partial.author.en || "—" });
+              if (partial.analysis) setAnalysis(normalizeAnalysis(partial.analysis) ?? partial.analysis);
+            } else {
+              setContent((prev) => [...prev, ...partial.pairs]);
+            }
+          }
+        );
       } catch (streamErr: unknown) {
         let fallbackPercent = 20;
         const fallbackTimer = setInterval(() => {
@@ -569,8 +594,8 @@ export default function App() {
           </header>
         ) : null}
 
-        {/* Loading State */}
-        {isTranslating && (
+        {/* Full Loading State - 尚未收到任何段落时 */}
+        {isTranslating && content.length === 0 && (
           <div className="flex flex-col items-center justify-center py-32 space-y-8 max-w-xl mx-auto">
             <div className="relative w-full">
               <Loader2 className="w-16 h-16 animate-spin text-ink/40 relative z-10 mx-auto mb-8 block" />
@@ -592,9 +617,27 @@ export default function App() {
           </div>
         )}
 
-        {/* Content Section - Bilingual Grid */}
-        {!isTranslating && (
+        {/* Compact Progress - 已有段落显示时，顶部紧凑进度条 */}
+        {isTranslating && content.length > 0 && (
+          <div className="sticky top-20 z-40 py-4 px-6 mb-8 rounded-2xl bg-white/60 backdrop-blur-md border border-ink/10 shadow-lg max-w-2xl mx-auto">
+            <div className="h-1.5 bg-ink/10 rounded-full overflow-hidden">
+              <motion.div
+                className="h-full bg-ink/40 rounded-full"
+                initial={{ width: 0 }}
+                animate={{ width: `${progress?.percent ?? 0}%` }}
+                transition={{ duration: 0.3, ease: "easeOut" }}
+              />
+            </div>
+            <p className="mt-2 font-sans text-xs text-ink/50 text-center">
+              {progress?.step ?? "翻译中..."} {progress?.percent ?? 0}%
+            </p>
+          </div>
+        )}
+
+        {/* Content Section - 有内容或翻译完成时展示 */}
+        {(content.length > 0 || !isTranslating) && (
           <>
+            {content.length > 0 && (
             <article className="space-y-16">
               {content.map((pair, index) => (
                 <motion.div
@@ -617,6 +660,7 @@ export default function App() {
                 </motion.div>
               ))}
             </article>
+            )}
 
             {/* Analysis Section */}
             {analysis && (

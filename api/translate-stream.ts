@@ -118,6 +118,28 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
   };
 }
 
+/** 将模型可能返回的各种 translation 格式统一为数组，兼容字符串数组、对象数组、数字键对象等 */
+function normalizeTranslationToArray(raw: unknown, expectedLen: number): unknown[] {
+  if (Array.isArray(raw)) {
+    return raw;
+  }
+  if (raw && typeof raw === 'object') {
+    const o = raw as Record<string, unknown>;
+    const arr: unknown[] = [];
+    for (let i = 0; i < expectedLen; i++) {
+      const v = o[String(i)] ?? o[i];
+      if (v !== undefined && v !== null) arr.push(v);
+    }
+    if (arr.length > 0) return arr;
+    const values = Object.values(o);
+    if (values.length > 0) return values;
+  }
+  if (typeof raw === 'string') {
+    return raw.split(/\n\s*\n/).filter(Boolean);
+  }
+  return [];
+}
+
 function mergeTranslation(
   sourceParagraphs: string[],
   raw: unknown[],
@@ -316,21 +338,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
 
     const fj = await callDeepSeek(fullPrompt(chunks[0]), DEEPSEEK_API_KEY);
-    if (!Array.isArray(fj?.translation)) {
+    const firstRaw = normalizeTranslationToArray(fj?.translation, chunks[0].length);
+    if (firstRaw.length === 0) {
       write({ type: 'error', message: '模型返回格式异常，请重试' });
       return res.end();
     }
     firstJson = fj;
-    allTranslations.push(...mergeTranslation(chunks[0], fj.translation as unknown[], sourceLang));
+    const firstPairs = mergeTranslation(chunks[0], firstRaw, sourceLang);
+    allTranslations.push(...firstPairs);
     write({ type: 'progress', chunk: 1, total, percent: Math.round((1 / total) * 100), step: `翻译第 1/${total} 段` });
+    write({
+      type: 'chunk_done',
+      chunkIndex: 1,
+      pairs: firstPairs,
+      title: firstJson.title ?? { en: '', zh: '' },
+      author: firstJson.author ?? { en: '', zh: '' },
+      analysis: normalizeAnalysis(firstJson.analysis),
+    });
 
     for (let i = 1; i < chunks.length; i++) {
       const chunkJson = await callDeepSeek(transOnlyPrompt(chunks[i]), DEEPSEEK_API_KEY);
-      if (Array.isArray(chunkJson?.translation)) {
-        allTranslations.push(...mergeTranslation(chunks[i], chunkJson.translation as unknown[], sourceLang));
+      const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunks[i].length);
+      const chunkPairs: { en: string; zh: string }[] = chunkRaw.length > 0
+        ? mergeTranslation(chunks[i], chunkRaw, sourceLang)
+        : [];
+      if (chunkPairs.length > 0) {
+        allTranslations.push(...chunkPairs);
       }
       const pct = Math.round(((i + 1) / total) * 100);
       write({ type: 'progress', chunk: i + 1, total, percent: pct, step: `翻译第 ${i + 1}/${total} 段` });
+      write({ type: 'chunk_done', chunkIndex: i + 1, pairs: chunkPairs });
     }
 
     if (!firstJson.title) firstJson.title = { en: '', zh: '' };

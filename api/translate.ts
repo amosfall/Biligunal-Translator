@@ -82,6 +82,24 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
   };
 }
 
+/** 将模型可能返回的各种 translation 格式统一为数组 */
+function normalizeTranslationToArray(raw: unknown, expectedLen: number): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    const o = raw as Record<string, unknown>;
+    const arr: unknown[] = [];
+    for (let i = 0; i < expectedLen; i++) {
+      const v = o[String(i)] ?? o[i];
+      if (v !== undefined && v !== null) arr.push(v);
+    }
+    if (arr.length > 0) return arr;
+    const values = Object.values(o);
+    if (values.length > 0) return values;
+  }
+  if (typeof raw === 'string') return raw.split(/\n\s*\n/).filter(Boolean);
+  return [];
+}
+
 function mergeTranslation(
   sourceParagraphs: string[],
   raw: unknown[],
@@ -243,13 +261,14 @@ ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
         }
       }
     }
-    if (!Array.isArray(json?.translation)) {
+    const translationRaw = normalizeTranslationToArray(json?.translation, paragraphs.length);
+    if (translationRaw.length === 0) {
       return res.status(500).json({ error: '模型返回格式异常，请重试' });
     }
     if (!json.title) json.title = { en: '', zh: '' };
     if (!json.author) json.author = { en: '', zh: '' };
 
-    const translation = mergeTranslation(paragraphs, json.translation, sourceLang);
+    const translation = mergeTranslation(paragraphs, translationRaw, sourceLang);
     const fallback = extractTitleAuthorFromTranslation(translation);
     const isEmpty = (t: { en?: string; zh?: string }) => {
       const v = (t?.en?.trim() || t?.zh?.trim() || '').replace(/[—\-]/g, '');
