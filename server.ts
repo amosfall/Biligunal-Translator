@@ -292,6 +292,14 @@ function normalizeTranslationToArray(raw: unknown, expectedLen: number): unknown
   return [];
 }
 
+/** 移除模型可能回显的段落标记（如 # Paragraph 8、# 段落 9） */
+function stripParagraphMarkers(s: string): string {
+  return s
+    .replace(/(?:^|\n)\s*#\s*(?:Paragraph|段落)\s*\d+\s*(?:\n|$)/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function mergeTranslation(
   sourceParagraphs: string[],
   raw: unknown[],
@@ -301,10 +309,10 @@ function mergeTranslation(
     const v = raw[i];
     let translated = '';
     if (typeof v === 'string') {
-      translated = v;
+      translated = stripParagraphMarkers(v);
     } else if (v && typeof v === 'object') {
       const key = sourceLang === 'zh' ? 'en' : 'zh';
-      translated = String((v as Record<string, unknown>)[key] ?? '');
+      translated = stripParagraphMarkers(String((v as Record<string, unknown>)[key] ?? ''));
     }
     return sourceLang === 'zh'
       ? { en: translated, zh: src }
