@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
 
-const CHUNK_SIZE = 5500;
+const CHUNK_SIZE = 10000;
 
 function splitIntoChunks(paragraphs: string[], maxChars: number): string[][] {
   // 先将超长单段落在句子边界处拆分，避免单段超出 token 限制
@@ -168,46 +168,6 @@ function mergeTranslation(
   });
 }
 
-function buildFullPrompt(paragraphs: string[]): string {
-  return `你是一个专业的中英双语文学编辑。
-
-请你将下面的英文段落翻译为中文，并给出结构化的写作分析。同时必须从正文中准确识别并提取文章的标题和作者。
-
-【标题提取规则】
-- 标题通常是第一段或第一行，多为短语（如 "TOKYO WEEDS"、"东京杂草"）
-- 若首段是短句（≤60 字、无句号结尾），即视为标题
-- 保持原标题的格式（全大写、大小写等）
-
-【作者提取规则】
-- 作者常见格式：英文 "Author: Amos"、"By John Smith"；中文 "作者：阿莫斯"
-- 可能出现在标题下方、文首或文末
-- 只提取作者姓名，去掉 "作者："、"Author:"、"By" 等前缀
-
-【字数上限】必须严格遵守，宁可精简不可超出：
-- summary：≤60 汉字
-- narrativeDetail：≤200 汉字
-- themes / pros / cons 每项：≤40 汉字
-如果内容不足以填满，请精简表述，不要超出上限。
-
-输出必须是严格的 JSON，结构如下（不要多余文字）。translation 仅返回中文翻译数组，顺序与输入段落一一对应，不要回显英文。
-【重要】analysis 为必填项，每个字段均需提供 en（英文）和 zh（中文）两个版本。
-{
-  "title": { "en": "英文标题", "zh": "中文标题" },
-  "author": { "en": "英文作者名", "zh": "中文作者名" },
-  "translation": ["中文翻译1", "中文翻译2", "..."],
-  "analysis": {
-    "summary": { "en": "one-sentence summary (≤60 words)", "zh": "一句话概括（≤60字）" },
-    "narrativeDetail": { "en": "narrative analysis (≤200 words)", "zh": "叙事分析（≤200字）" },
-    "themes": [{ "en": "theme in English", "zh": "中文主题" }],
-    "pros": [{ "en": "strength in English", "zh": "中文优点" }],
-    "cons": [{ "en": "weakness in English", "zh": "中文不足" }]
-  }
-}
-
-待翻译的英文段落如下（保持顺序）：
-${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
-}
-
 function buildTranslationOnlyPrompt(paragraphs: string[]): string {
   return `将以下英文段落翻译为中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显英文：
 {
@@ -218,30 +178,35 @@ function buildTranslationOnlyPrompt(paragraphs: string[]): string {
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-function buildZhToEnFullPrompt(paragraphs: string[]): string {
-  return `你是一个专业的中英双语文学编辑。
+function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'): string {
+  const langLabel = sourceLang === 'zh' ? '中文' : '英文';
+  return `你是一个专业的中英双语文学编辑。请对以下${langLabel}文章进行结构化写作分析，并提取标题和作者。
 
-请你将下面的中文段落翻译为流畅的英文，并给出结构化的写作分析。
-同时从正文中识别并提取文章标题和作者。
+【标题提取规则】
+- 标题通常是第一段或第一行，多为短语
+- 若首段是短句（≤60 字、无句号结尾），即视为标题
+
+【作者提取规则】
+- 常见格式：英文 "Author: XXX"、"By XXX"；中文 "作者：XXX"
+- 只提取姓名，去掉前缀
 
 【字数上限】summary≤60字，narrativeDetail≤200字，其余每项≤40字
 
-输出严格 JSON，translation 仅返回英文翻译数组，顺序与输入一一对应，不要回显中文。analysis 每字段均需提供 en 和 zh 两个版本。
+输出严格 JSON：
 {
   "title": { "en": "...", "zh": "..." },
   "author": { "en": "...", "zh": "..." },
-  "translation": ["English 1", "English 2", "..."],
   "analysis": {
-    "summary": { "en": "one-sentence summary (≤60 words)", "zh": "一句话概括（≤60字）" },
-    "narrativeDetail": { "en": "narrative analysis (≤200 words)", "zh": "叙事分析（≤200字）" },
-    "themes": [{ "en": "theme in English", "zh": "中文主题" }],
-    "pros": [{ "en": "strength in English", "zh": "中文优点" }],
-    "cons": [{ "en": "weakness in English", "zh": "中文不足" }]
+    "summary": { "en": "...", "zh": "..." },
+    "narrativeDetail": { "en": "...", "zh": "..." },
+    "themes": [{ "en": "...", "zh": "..." }],
+    "pros": [{ "en": "...", "zh": "..." }],
+    "cons": [{ "en": "...", "zh": "..." }]
   }
 }
 
-待翻译的中文段落：
-${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+文章内容：
+${paragraphs.slice(0, 15).map((p, i) => `# ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
 function buildZhToEnTranslationOnlyPrompt(paragraphs: string[]): string {
@@ -335,66 +300,56 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       (res as unknown as { flushHeaders: () => void }).flushHeaders();
     }
 
-    const fullPrompt = sourceLang === 'zh' ? buildZhToEnFullPrompt : buildFullPrompt;
     const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
 
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
     const total = chunks.length;
-    const allTranslations: { en: string; zh: string }[] = [];
-    let firstJson: Record<string, unknown> = { title: { en: '', zh: '' }, author: { en: '', zh: '' }, analysis: null };
+    const allTranslations: { en: string; zh: string }[][] = new Array(total);
+    let completedCount = 0;
 
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
 
-    const fj = await callDeepSeek(fullPrompt(chunks[0]), DEEPSEEK_API_KEY);
-    const firstRaw = normalizeTranslationToArray(fj?.translation, chunks[0].length);
-    if (firstRaw.length === 0) {
+    // analysis 与所有翻译块完全并行
+    const analysisPromise = callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, sourceLang), DEEPSEEK_API_KEY);
+
+    // 所有翻译块并行发起，每块完成后立即推送进度
+    const chunkPromises = chunks.map((chunk, i) =>
+      callDeepSeek(transOnlyPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
+        const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunk.length);
+        const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, sourceLang) : [];
+        allTranslations[i] = chunkPairs;
+        completedCount++;
+        const pct = Math.round((completedCount / total) * 100);
+        write({ type: 'progress', chunk: completedCount, total, percent: pct, step: `翻译第 ${completedCount}/${total} 段` });
+        write({ type: 'chunk_done', chunkIndex: i + 1, pairs: chunkPairs });
+      })
+    );
+
+    const [analysisJson] = await Promise.all([analysisPromise, ...chunkPromises]);
+
+    const flatTranslations = allTranslations.flat();
+    if (flatTranslations.length === 0) {
       write({ type: 'error', message: '模型返回格式异常，请重试' });
       return res.end();
     }
-    firstJson = fj;
-    const firstPairs = mergeTranslation(chunks[0], firstRaw, sourceLang);
-    allTranslations.push(...firstPairs);
-    write({ type: 'progress', chunk: 1, total, percent: Math.round((1 / total) * 100), step: `翻译第 1/${total} 段` });
-    write({
-      type: 'chunk_done',
-      chunkIndex: 1,
-      pairs: firstPairs,
-      title: firstJson.title ?? { en: '', zh: '' },
-      author: firstJson.author ?? { en: '', zh: '' },
-      analysis: normalizeAnalysis(firstJson.analysis),
-    });
 
-    for (let i = 1; i < chunks.length; i++) {
-      const chunkJson = await callDeepSeek(transOnlyPrompt(chunks[i]), DEEPSEEK_API_KEY);
-      const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunks[i].length);
-      const chunkPairs: { en: string; zh: string }[] = chunkRaw.length > 0
-        ? mergeTranslation(chunks[i], chunkRaw, sourceLang)
-        : [];
-      if (chunkPairs.length > 0) {
-        allTranslations.push(...chunkPairs);
-      }
-      const pct = Math.round(((i + 1) / total) * 100);
-      write({ type: 'progress', chunk: i + 1, total, percent: pct, step: `翻译第 ${i + 1}/${total} 段` });
-      write({ type: 'chunk_done', chunkIndex: i + 1, pairs: chunkPairs });
-    }
+    let title = (analysisJson?.title as { en: string; zh: string }) ?? { en: '', zh: '' };
+    let author = (analysisJson?.author as { en: string; zh: string }) ?? { en: '', zh: '' };
 
-    if (!firstJson.title) firstJson.title = { en: '', zh: '' };
-    if (!firstJson.author) firstJson.author = { en: '', zh: '' };
-
-    const fallback = extractTitleAuthorFromTranslation(allTranslations);
+    const fallback = extractTitleAuthorFromTranslation(flatTranslations);
     const isEmpty = (t: { en?: string; zh?: string }) => {
       const v = (t?.en?.trim() || t?.zh?.trim() || '').replace(/[—\-]/g, '');
       return !v;
     };
-    if (isEmpty(firstJson.title as object) && (fallback.title?.en || fallback.title?.zh)) {
-      firstJson.title = fallback.title;
+    if (isEmpty(title) && (fallback.title?.en || fallback.title?.zh)) {
+      title = fallback.title!;
     }
-    if (isEmpty(firstJson.author as object) && (fallback.author?.en || fallback.author?.zh)) {
-      firstJson.author = fallback.author;
+    if (isEmpty(author) && (fallback.author?.en || fallback.author?.zh)) {
+      author = fallback.author!;
     }
 
-    const analysis = normalizeAnalysis(firstJson.analysis);
-    write({ type: 'done', result: { ...firstJson, translation: allTranslations, analysis } });
+    const analysis = normalizeAnalysis(analysisJson?.analysis);
+    write({ type: 'done', result: { title, author, translation: flatTranslations, analysis } });
     res.end();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
