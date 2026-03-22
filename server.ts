@@ -185,8 +185,11 @@ async function callDeepSeek(prompt: string, apiKey: string): Promise<Record<stri
   return parseDeepSeekJson(data.choices?.[0]?.message?.content ?? '');
 }
 
-function buildTranslationOnlyPrompt(paragraphs: string[]): string {
-  return `将以下英文段落翻译为中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显英文：
+const LANG_NAMES: Record<string, string> = { en: '英文', fr: '法文', ja: '日文', 'zh-TW': '繁体中文', zh: '中文' };
+
+function buildTranslationToZhPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为简体中文，仅输出 JSON，格式如下（不要多余文字）。translation 为简体中文数组，顺序与输入一一对应，不要回显原文：
 {
   "translation": ["中文1", "中文2", "..."]
 }
@@ -203,8 +206,8 @@ function buildZhToEnTranslationOnlyPrompt(paragraphs: string[]): string {
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'): string {
-  const langLabel = sourceLang === 'zh' ? '中文' : '英文';
+function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): string {
+  const langLabel = LANG_NAMES[sourceLang] || '英文';
   return `你是一个专业的中英双语文学编辑。请对以下${langLabel}文章进行结构化写作分析，并提取标题和作者。
 
 【标题提取规则】
@@ -215,7 +218,8 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'):
 - 常见格式：英文 "Author: XXX"、"By XXX"；中文 "作者：XXX"
 - 只提取姓名，去掉前缀
 
-【字数上限】summary≤60字，narrativeDetail≤200字，其余每项≤40字
+【字数上限】summary≤60字，narrativeDetail≤200字，plotSynopsis约500字（详细的剧情梗概），其余每项≤40字
+【人物提取】characters 数组列出文中主要人物，每个人物包含 name 和 description（简要介绍其身份、性格、在故事中的角色）
 
 输出严格 JSON：
 {
@@ -224,6 +228,8 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'):
   "analysis": {
     "summary": { "en": "...", "zh": "..." },
     "narrativeDetail": { "en": "...", "zh": "..." },
+    "plotSynopsis": { "en": "...(~500 words plot synopsis)...", "zh": "...(~500字剧情梗概)..." },
+    "characters": [{ "name": { "en": "...", "zh": "..." }, "description": { "en": "...", "zh": "..." } }],
     "themes": [{ "en": "...", "zh": "..." }],
     "pros": [{ "en": "...", "zh": "..." }],
     "cons": [{ "en": "...", "zh": "..." }]
@@ -235,7 +241,8 @@ ${paragraphs.slice(0, 15).map((p, i) => `# ${i + 1}\n${p}`).join('\n\n')}`.trim(
 }
 
 type BilingualStr = { en: string; zh: string };
-type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[] };
+type CharacterInfo = { name: BilingualStr; description: BilingualStr };
+type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[]; plotSynopsis?: BilingualStr; characters?: CharacterInfo[] };
 
 /** 规范化模型返回的 analysis，支持双语对象和旧版纯字符串 */
 function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
@@ -263,9 +270,20 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
   const themes = toArr(o.themes ?? o.Themes);
   const pros = toArr(o.pros ?? o.Pros);
   const cons = toArr(o.cons ?? o.Cons);
+  const plotSynopsis = toBilingual(o.plotSynopsis ?? o.plot_synopsis ?? o.PlotSynopsis);
+  const characters: CharacterInfo[] = (() => {
+    const raw = o.characters ?? o.Characters;
+    if (!Array.isArray(raw)) return [];
+    return raw.map((c: unknown) => {
+      if (!c || typeof c !== 'object') return { name: { en: '', zh: '' }, description: { en: '', zh: '' } };
+      const ch = c as Record<string, unknown>;
+      return { name: toBilingual(ch.name ?? ch.Name), description: toBilingual(ch.description ?? ch.Description) };
+    }).filter((c: CharacterInfo) => c.name.en || c.name.zh);
+  })();
 
   const hasContent = summary.en || summary.zh || narrativeDetail.en || narrativeDetail.zh ||
-    themes.length > 0 || pros.length > 0 || cons.length > 0;
+    themes.length > 0 || pros.length > 0 || cons.length > 0 ||
+    plotSynopsis.en || plotSynopsis.zh || characters.length > 0;
   if (!hasContent) return null;
 
   const ph: BilingualStr = { en: '—', zh: '—' };
@@ -275,6 +293,8 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
     themes: themes.length ? themes : [ph],
     pros: pros.length ? pros : [ph],
     cons: cons.length ? cons : [ph],
+    plotSynopsis: (plotSynopsis.en || plotSynopsis.zh) ? plotSynopsis : undefined,
+    characters: characters.length > 0 ? characters : undefined,
   };
 }
 
@@ -347,19 +367,20 @@ app.post('/api/translate', async (req, res) => {
   }
 
   try {
-    const { paragraphs, sourceLang = 'en' } = req.body as { paragraphs: string[]; sourceLang?: 'en' | 'zh' };
+    const { paragraphs, sourceLang = 'en', sourceLangFull } = req.body as { paragraphs: string[]; sourceLang?: string; sourceLangFull?: string };
+    const lang = sourceLangFull || sourceLang;
+    const mergeLang: 'en' | 'zh' = lang === 'zh' ? 'zh' : 'en';
 
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
     }
 
-    const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
+    const transOnlyPrompt = (chunk: string[]) => buildTranslationToZhPrompt(chunk, lang);
 
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
 
-    // 所有块全部用 translation-only prompt，与 analysis 完全并行
     const [analysisJson, ...translationResults] = await Promise.all([
-      callDeepSeekCached(buildAnalysisOnlyPrompt(paragraphs, sourceLang), DEEPSEEK_API_KEY),
+      callDeepSeekCached(buildAnalysisOnlyPrompt(paragraphs, lang), DEEPSEEK_API_KEY),
       ...chunks.map((chunk) => callDeepSeekCached(transOnlyPrompt(chunk), DEEPSEEK_API_KEY)),
     ]);
 
@@ -367,7 +388,7 @@ app.post('/api/translate', async (req, res) => {
     for (let i = 0; i < chunks.length; i++) {
       const chunkRaw = normalizeTranslationToArray(translationResults[i]?.translation, chunks[i].length);
       if (chunkRaw.length > 0) {
-        allTranslations.push(...mergeTranslation(chunks[i], chunkRaw, sourceLang));
+        allTranslations.push(...mergeTranslation(chunks[i], chunkRaw, mergeLang));
       }
     }
 
@@ -417,7 +438,9 @@ app.post('/api/translate-stream', async (req, res) => {
   };
 
   try {
-    const { paragraphs, sourceLang = 'en' } = req.body as { paragraphs: string[]; sourceLang?: 'en' | 'zh' };
+    const { paragraphs, sourceLang = 'en', sourceLangFull } = req.body as { paragraphs: string[]; sourceLang?: string; sourceLangFull?: string };
+    const lang = sourceLangFull || sourceLang;
+    const mergeLang: 'en' | 'zh' = lang === 'zh' ? 'zh' : 'en';
 
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
@@ -428,7 +451,7 @@ app.post('/api/translate-stream', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
+    const transOnlyPrompt = (chunk: string[]) => buildTranslationToZhPrompt(chunk, lang);
 
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
     const total = chunks.length;
@@ -437,14 +460,13 @@ app.post('/api/translate-stream', async (req, res) => {
 
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
 
-    // analysis 与所有翻译块完全并行
-    const analysisPromise = callDeepSeekCached(buildAnalysisOnlyPrompt(paragraphs, sourceLang), DEEPSEEK_API_KEY);
+    const analysisPromise = callDeepSeekCached(buildAnalysisOnlyPrompt(paragraphs, lang), DEEPSEEK_API_KEY);
 
     // 所有翻译块并行发起，每块完成后立即推送进度
     const chunkPromises = chunks.map((chunk, i) =>
       callDeepSeekCached(transOnlyPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
         const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunk.length);
-        const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, sourceLang) : [];
+        const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, mergeLang) : [];
         allTranslations[i] = chunkPairs;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);
@@ -501,8 +523,17 @@ const TABLE_SQL = `CREATE TABLE IF NOT EXISTS translations (
   author_zh TEXT,
   author_en TEXT,
   content JSONB NOT NULL,
-  analysis JSONB
+  analysis JSONB,
+  annotations JSONB,
+  username TEXT,
+  source_lang TEXT
 )`;
+
+const MIGRATE_SQLS = [
+  `ALTER TABLE translations ADD COLUMN IF NOT EXISTS annotations JSONB`,
+  `ALTER TABLE translations ADD COLUMN IF NOT EXISTS username TEXT`,
+  `ALTER TABLE translations ADD COLUMN IF NOT EXISTS source_lang TEXT`,
+];
 
 async function withHistoryDb<T>(fn: (sql: ReturnType<typeof neon>) => Promise<T>): Promise<T | null> {
   const url = (process.env.DATABASE_URL || '').trim();
@@ -510,6 +541,7 @@ async function withHistoryDb<T>(fn: (sql: ReturnType<typeof neon>) => Promise<T>
   try {
     const sql = neon(url);
     await sql.query(TABLE_SQL);
+    for (const m of MIGRATE_SQLS) { try { await sql.query(m); } catch {} }
     return await fn(sql);
   } catch {
     return null;
@@ -518,7 +550,7 @@ async function withHistoryDb<T>(fn: (sql: ReturnType<typeof neon>) => Promise<T>
 
 app.get('/api/history', async (_req, res) => {
   const result = await withHistoryDb(async (sql) => {
-    const rows = await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis
+    const rows = await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
       FROM translations ORDER BY created_at_ms DESC LIMIT 100`;
     return rows as Record<string, unknown>[];
   });
@@ -530,30 +562,44 @@ app.get('/api/history', async (_req, res) => {
     author: { zh: String(r.author_zh ?? ''), en: String(r.author_en ?? '') },
     content: (r.content as { en: string; zh: string }[]) ?? [],
     analysis: (r.analysis as Record<string, unknown>) ?? null,
+    annotations: (r.annotations as Record<string, unknown>) ?? undefined,
+    username: r.username ? String(r.username) : undefined,
+    sourceLang: r.source_lang ? String(r.source_lang) : undefined,
   }));
   return res.json(items);
 });
 
 app.post('/api/history', async (req, res) => {
-  const body = req.body as { id?: string; createdAt?: number; title?: { zh: string; en: string }; author?: { zh: string; en: string }; content?: { en: string; zh: string }[]; analysis?: Record<string, unknown> | null };
+  const body = req.body as {
+    id?: string; createdAt?: number;
+    title?: { zh: string; en: string }; author?: { zh: string; en: string };
+    content?: { en: string; zh: string }[];
+    analysis?: Record<string, unknown> | null;
+    annotations?: Record<string, unknown> | null;
+    username?: string; sourceLang?: string;
+  };
   const id = (body?.id || crypto.randomUUID()) as string;
   const createdAt = typeof body?.createdAt === 'number' ? body.createdAt : Date.now();
   const title = body?.title ?? { zh: '', en: '' };
   const author = body?.author ?? { zh: '', en: '' };
   const content = Array.isArray(body?.content) ? body.content : [];
   const analysis = body?.analysis ?? null;
+  const annotations = body?.annotations ?? null;
+  const dbUsername = body?.username || null;
+  const dbSourceLang = body?.sourceLang || null;
   if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
   const contentStr = JSON.stringify(content);
   const analysisStr = analysis ? JSON.stringify(analysis) : null;
+  const annotationsStr = annotations ? JSON.stringify(annotations) : null;
   const ok = await withHistoryDb(async (sql) => {
-    // 使用 JSON.stringify + 无显式 cast，由列类型隐式转换为 JSONB（node-pg 推荐做法）
     await sql.query(
-      `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
-         author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis`,
-      [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr]
+         author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis,
+         annotations = EXCLUDED.annotations, username = EXCLUDED.username, source_lang = EXCLUDED.source_lang`,
+      [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr, annotationsStr, dbUsername, dbSourceLang]
     );
     return true;
   });

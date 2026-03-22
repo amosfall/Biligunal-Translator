@@ -76,7 +76,8 @@ function extractTitleAuthorFromTranslation(
 }
 
 type BilingualStr = { en: string; zh: string };
-type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[] };
+type CharacterInfo = { name: BilingualStr; description: BilingualStr };
+type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[]; plotSynopsis?: BilingualStr; characters?: CharacterInfo[] };
 
 function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -103,9 +104,20 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
   const themes = toArr(o.themes ?? o.Themes);
   const pros = toArr(o.pros ?? o.Pros);
   const cons = toArr(o.cons ?? o.Cons);
+  const plotSynopsis = toBilingual(o.plotSynopsis ?? o.plot_synopsis ?? o.PlotSynopsis);
+  const characters: CharacterInfo[] = (() => {
+    const raw = o.characters ?? o.Characters;
+    if (!Array.isArray(raw)) return [];
+    return raw.map((c: unknown) => {
+      if (!c || typeof c !== 'object') return { name: { en: '', zh: '' }, description: { en: '', zh: '' } };
+      const ch = c as Record<string, unknown>;
+      return { name: toBilingual(ch.name ?? ch.Name), description: toBilingual(ch.description ?? ch.Description) };
+    }).filter((c: CharacterInfo) => c.name.en || c.name.zh);
+  })();
 
   const hasContent = summary.en || summary.zh || narrativeDetail.en || narrativeDetail.zh ||
-    themes.length > 0 || pros.length > 0 || cons.length > 0;
+    themes.length > 0 || pros.length > 0 || cons.length > 0 ||
+    plotSynopsis.en || plotSynopsis.zh || characters.length > 0;
   if (!hasContent) return null;
 
   const ph: BilingualStr = { en: '—', zh: '—' };
@@ -115,6 +127,8 @@ function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
     themes: themes.length ? themes : [ph],
     pros: pros.length ? pros : [ph],
     cons: cons.length ? cons : [ph],
+    plotSynopsis: (plotSynopsis.en || plotSynopsis.zh) ? plotSynopsis : undefined,
+    characters: characters.length > 0 ? characters : undefined,
   };
 }
 
@@ -168,8 +182,11 @@ function mergeTranslation(
   });
 }
 
-function buildTranslationOnlyPrompt(paragraphs: string[]): string {
-  return `将以下英文段落翻译为中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显英文：
+const LANG_NAMES: Record<string, string> = { en: '英文', fr: '法文', ja: '日文', 'zh-TW': '繁体中文', zh: '中文' };
+
+function buildTranslationToZhPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为简体中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显原文：
 {
   "translation": ["中文1", "中文2", "..."]
 }
@@ -178,8 +195,8 @@ function buildTranslationOnlyPrompt(paragraphs: string[]): string {
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'): string {
-  const langLabel = sourceLang === 'zh' ? '中文' : '英文';
+function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): string {
+  const langLabel = LANG_NAMES[sourceLang] || '外文';
   return `你是一个专业的中英双语文学编辑。请对以下${langLabel}文章进行结构化写作分析，并提取标题和作者。
 
 【标题提取规则】
@@ -190,7 +207,8 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'):
 - 常见格式：英文 "Author: XXX"、"By XXX"；中文 "作者：XXX"
 - 只提取姓名，去掉前缀
 
-【字数上限】summary≤60字，narrativeDetail≤200字，其余每项≤40字
+【字数上限】summary≤60字，narrativeDetail≤200字，plotSynopsis约500字（详细的剧情梗概），其余每项≤40字
+【人物提取】characters 数组列出文中主要人物，每个人物包含 name 和 description（简要介绍其身份、性格、在故事中的角色）
 
 输出严格 JSON：
 {
@@ -199,6 +217,8 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: 'en' | 'zh'):
   "analysis": {
     "summary": { "en": "...", "zh": "..." },
     "narrativeDetail": { "en": "...", "zh": "..." },
+    "plotSynopsis": { "en": "...(~500 words plot synopsis)...", "zh": "...(~500字剧情梗概)..." },
+    "characters": [{ "name": { "en": "...", "zh": "..." }, "description": { "en": "...", "zh": "..." } }],
     "themes": [{ "en": "...", "zh": "..." }],
     "pros": [{ "en": "...", "zh": "..." }],
     "cons": [{ "en": "...", "zh": "..." }]
@@ -288,7 +308,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   };
 
   try {
-    const { paragraphs, sourceLang = 'en' } = (req.body || {}) as { paragraphs?: string[]; sourceLang?: 'en' | 'zh' };
+    const { paragraphs, sourceLang = 'en', sourceLangFull } = (req.body || {}) as { paragraphs?: string[]; sourceLang?: string; sourceLangFull?: string };
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
     }
@@ -300,7 +320,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       (res as unknown as { flushHeaders: () => void }).flushHeaders();
     }
 
-    const transOnlyPrompt = sourceLang === 'zh' ? buildZhToEnTranslationOnlyPrompt : buildTranslationOnlyPrompt;
+    const lang = sourceLangFull || sourceLang || 'en';
+    const transPrompt = lang === 'zh' ? buildZhToEnTranslationOnlyPrompt : (chunk: string[]) => buildTranslationToZhPrompt(chunk, lang);
+    const mergeLang: 'en' | 'zh' = lang === 'zh' ? 'zh' : 'en';
 
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
     const total = chunks.length;
@@ -310,13 +332,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
 
     // analysis 与所有翻译块完全并行
-    const analysisPromise = callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, sourceLang), DEEPSEEK_API_KEY);
+    const analysisPromise = callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, lang), DEEPSEEK_API_KEY);
 
     // 所有翻译块并行发起，每块完成后立即推送进度
     const chunkPromises = chunks.map((chunk, i) =>
-      callDeepSeek(transOnlyPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
+      callDeepSeek(transPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
         const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunk.length);
-        const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, sourceLang) : [];
+        const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, mergeLang) : [];
         allTranslations[i] = chunkPairs;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);
