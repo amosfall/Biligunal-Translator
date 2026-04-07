@@ -313,6 +313,8 @@ export default function App() {
   const [storageMode, setStorageMode] = useState<StorageMode>(() =>
     (localStorage.getItem(STORAGE_MODE_KEY) as StorageMode) || "local"
   );
+  /** 与 CLERK_ADMIN_USER_IDS 对齐；避免仅 Vercel 构建缺 VITE_CLERK_ADMIN_USER_IDS 时误把管理员数据滤掉 */
+  const [serverHistoryAdmin, setServerHistoryAdmin] = useState(false);
 
   const toggleStorageMode = () => {
     const next: StorageMode = storageMode === "local" ? "cloud" : "local";
@@ -344,6 +346,10 @@ export default function App() {
       setAnnotations([]);
     }
   }, [auth.isLoaded, auth.userId]);
+
+  useEffect(() => {
+    if (!auth.userId) setServerHistoryAdmin(false);
+  }, [auth.userId]);
 
   // ─── Search logic ───
   interface SearchMatch {
@@ -474,10 +480,11 @@ export default function App() {
   };
 
   const isHistoryAdmin =
-    Boolean(auth.userId) && auth.mode === "clerk" && clerkAdminIdsFromEnv().has(auth.userId!);
+    (Boolean(auth.userId) && auth.mode === "clerk" && clerkAdminIdsFromEnv().has(auth.userId!)) ||
+    serverHistoryAdmin;
   const historyCap = isHistoryAdmin ? MAX_HISTORY_ADMIN : MAX_HISTORY;
 
-  // 普通用户只看自己的；管理员（VITE_CLERK_ADMIN_USER_IDS）看全部
+  // 普通用户只看自己的；管理员（环境变量或服务端 X-History-Admin）看全部
   const userHistory = !auth.userId
     ? []
     : isHistoryAdmin
@@ -495,6 +502,8 @@ export default function App() {
       if (t) headers.Authorization = `Bearer ${t}`;
       try {
         const res = await fetch("/api/history", { headers });
+        const fromServerAdmin = res.headers.get("X-History-Admin") === "1";
+        if (!cancelled) setServerHistoryAdmin(fromServerAdmin);
         const text = await res.text();
         if (!res.ok || cancelled) return;
         let parsed: unknown;
@@ -504,8 +513,11 @@ export default function App() {
           parsed = JSON5.parse(text);
         }
         const items = parsed as HistoryItem[];
+        const envAdm =
+          Boolean(auth.userId) && auth.mode === "clerk" && clerkAdminIdsFromEnv().has(auth.userId!);
+        const cap = envAdm || fromServerAdmin ? MAX_HISTORY_ADMIN : MAX_HISTORY;
         if (Array.isArray(items) && items.length > 0) {
-          const sliced = items.slice(0, historyCap);
+          const sliced = items.slice(0, cap);
           setHistory(sliced);
           try {
             localStorage.setItem(HISTORY_KEY, JSON.stringify(sliced));
@@ -518,7 +530,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [storageMode, auth.isLoaded, auth.userId, auth.getApiToken, auth.mode, historyCap]);
+  }, [storageMode, auth.isLoaded, auth.userId, auth.getApiToken, auth.mode]);
 
   useEffect(() => {
     try {

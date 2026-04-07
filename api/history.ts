@@ -119,6 +119,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ...it,
       ownerDisplayName: it.username ? (labelMap.get(it.username) ?? it.username) : undefined,
     }));
+    res.setHeader('Access-Control-Expose-Headers', 'X-History-Admin');
+    res.setHeader('X-History-Admin', admin ? '1' : '0');
     return res.json(enriched);
   }
 
