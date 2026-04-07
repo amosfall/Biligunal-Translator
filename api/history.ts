@@ -1,5 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { neon } from '@neondatabase/serverless';
+import { verifyToken } from '@clerk/backend';
+import { resolveOwnerDisplayNames } from '../lib/clerkUserDisplay.ts';
 
 const TABLE_SQL = `CREATE TABLE IF NOT EXISTS translations (
   id TEXT PRIMARY KEY,
@@ -27,22 +29,72 @@ async function withHistoryDb<T>(fn: (sql: Awaited<ReturnType<typeof neon>>) => P
   try {
     const sql = neon(url);
     await sql.query(TABLE_SQL);
-    for (const m of MIGRATE_SQLS) { try { await sql.query(m); } catch {} }
+    for (const m of MIGRATE_SQLS) {
+      try {
+        await sql.query(m);
+      } catch {}
+    }
     return await fn(sql);
   } catch {
     return null;
   }
 }
 
+type ClerkHistoryAuth = 'legacy' | { userId: string } | 'unauthorized';
+
+function getBearerToken(req: VercelRequest): string | null {
+  const raw = req.headers.authorization;
+  const h = Array.isArray(raw) ? raw[0] : raw;
+  return h?.startsWith('Bearer ') ? h.slice(7) : null;
+}
+
+async function resolveClerkHistoryUser(req: VercelRequest): Promise<ClerkHistoryAuth> {
+  const secret = (process.env.CLERK_SECRET_KEY || '').trim();
+  if (!secret) return 'legacy';
+  const token = getBearerToken(req);
+  if (!token) return 'unauthorized';
+  try {
+    const payload = await verifyToken(token, { secretKey: secret });
+    const sub = payload.sub;
+    if (typeof sub !== 'string' || !sub) return 'unauthorized';
+    return { userId: sub };
+  } catch {
+    return 'unauthorized';
+  }
+}
+
+function getClerkHistoryAdminIds(): Set<string> {
+  const raw = (process.env.CLERK_ADMIN_USER_IDS || '').trim();
+  if (!raw) return new Set();
+  return new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+}
+
+function isClerkHistoryAdmin(userId: string): boolean {
+  return getClerkHistoryAdminIds().has(userId);
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const origin = (req.headers.origin as string) || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   if (req.method === 'GET') {
+    const auth = await resolveClerkHistoryUser(req);
+    if (auth === 'unauthorized') {
+      return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+    }
+    const admin = auth !== 'legacy' && isClerkHistoryAdmin(auth.userId);
     const result = await withHistoryDb(async (sql) => {
-      const rows = await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
-        FROM translations ORDER BY created_at_ms DESC LIMIT 100`;
+      const rows =
+        auth === 'legacy'
+          ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+              FROM translations ORDER BY created_at_ms DESC LIMIT 100`
+          : admin
+            ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+                FROM translations ORDER BY created_at_ms DESC LIMIT 500`
+            : await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+                FROM translations WHERE username = ${auth.userId} ORDER BY created_at_ms DESC LIMIT 100`;
       return rows as Record<string, unknown>[];
     });
     if (result === null) {
@@ -59,10 +111,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       username: r.username ? String(r.username) : undefined,
       sourceLang: r.source_lang ? String(r.source_lang) : undefined,
     }));
-    return res.json(items);
+    const labelMap = await resolveOwnerDisplayNames(
+      items.map((i) => i.username),
+      (process.env.CLERK_SECRET_KEY || '').trim()
+    );
+    const enriched = items.map((it) => ({
+      ...it,
+      ownerDisplayName: it.username ? (labelMap.get(it.username) ?? it.username) : undefined,
+    }));
+    return res.json(enriched);
   }
 
   if (req.method === 'POST') {
+    const auth = await resolveClerkHistoryUser(req);
+    if (auth === 'unauthorized') {
+      return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+    }
     const body = (req.body || {}) as {
       id?: string;
       createdAt?: number;
@@ -81,7 +145,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const content = Array.isArray(body?.content) ? body.content : [];
     const analysis = body?.analysis ?? null;
     const annotations = body?.annotations ?? null;
-    const dbUsername = body?.username || null;
+    const dbUsername = auth !== 'legacy' ? auth.userId : body?.username || null;
     const dbSourceLang = body?.sourceLang || null;
     if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
@@ -104,10 +168,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (req.method === 'DELETE') {
+    const auth = await resolveClerkHistoryUser(req);
+    if (auth === 'unauthorized') {
+      return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+    }
     const id = (req.query?.id ?? (req.body as { id?: string })?.id) as string | undefined;
     if (!id) return res.status(400).json({ error: '缺少 id' });
     const ok = await withHistoryDb(async (sql) => {
-      await sql`DELETE FROM translations WHERE id = ${id}`;
+      if (auth === 'legacy') {
+        await sql`DELETE FROM translations WHERE id = ${id}`;
+      } else if (isClerkHistoryAdmin(auth.userId)) {
+        await sql`DELETE FROM translations WHERE id = ${id}`;
+      } else {
+        await sql`DELETE FROM translations WHERE id = ${id} AND username = ${auth.userId}`;
+      }
       return true;
     });
     if (ok === null) return res.status(503).json({ error: '历史同步未配置。' });

@@ -4,6 +4,7 @@
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }],
   "functions": {
     "api/translate-stream.ts": { "maxDuration": 300 },
-    "api/translate.ts": { "maxDuration": 300 }
+    "api/translate.ts": { "maxDuration": 300 },
+    "api/text-followup.ts": { "maxDuration": 120 }
   }
 }

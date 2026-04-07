@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect, ChangeEvent } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback, ChangeEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { BookOpen, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle } from "lucide-react";
+import { BookOpen, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle, Search, ChevronUp } from "lucide-react";
 import mammoth from "mammoth";
 import JSON5 from "json5";
+import FloatingTextFollowup from "./FloatingTextFollowup";
+import { useAppAuth } from "./auth/AppAuthContext";
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -32,8 +34,17 @@ const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
   ja: "日本語",
   "zh-TW": "繁體中文",
 };
-const USERNAME_KEY = "bilingual-editorial-username";
 const SOURCE_LANG_KEY = "bilingual-editorial-source-lang";
+const LOCAL_USERNAME_STORAGE = "bilingual-editorial-username";
+
+function readLocalUsernameBoot(): string | null {
+  if (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY?.trim()) return null;
+  try {
+    return localStorage.getItem(LOCAL_USERNAME_STORAGE);
+  } catch {
+    return null;
+  }
+}
 
 function detectSourceLang(text: string): SourceLang {
   const sample = text.slice(0, 2000);
@@ -159,6 +170,8 @@ type Annotations = Annotation[];
 interface HistoryItem {
   id: string;
   username?: string;
+  /** 服务端根据 Clerk 解析后的展示名（username / 邮箱 / 姓名） */
+  ownerDisplayName?: string;
   sourceLang?: SourceLang;
   title: { zh: string; en: string };
   author: { zh: string; en: string };
@@ -170,6 +183,13 @@ interface HistoryItem {
 
 const HISTORY_KEY = "bilingual-editorial-history";
 const MAX_HISTORY = 50;
+const MAX_HISTORY_ADMIN = 500;
+
+function clerkAdminIdsFromEnv(): Set<string> {
+  const raw = import.meta.env.VITE_CLERK_ADMIN_USER_IDS?.trim() || "";
+  if (!raw) return new Set();
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+}
 const STORAGE_MODE_KEY = "bilingual-editorial-storage-mode";
 type StorageMode = "local" | "cloud";
 
@@ -226,18 +246,19 @@ const DEMO_ANALYSIS: ArticleAnalysis = {
 };
 
 export default function App() {
-  const [username, setUsername] = useState<string | null>(() => localStorage.getItem(USERNAME_KEY));
+  const auth = useAppAuth();
   const [loginInput, setLoginInput] = useState("");
   const [sourceLang, setSourceLang] = useState<SourceLang>(() =>
     (localStorage.getItem(SOURCE_LANG_KEY) as SourceLang) || "en"
   );
 
-  const isLoggedIn = !!username;
+  const isLoggedIn = auth.isLoaded && !!auth.userId;
+  const localUserBoot = readLocalUsernameBoot();
 
-  const [content, setContent] = useState<ParagraphPair[]>(() => isLoggedIn ? [] : DEMO_CONTENT);
-  const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => isLoggedIn ? null : DEMO_ANALYSIS);
-  const [title, setTitle] = useState(() => isLoggedIn ? { zh: "", en: "" } : DEMO_TITLE);
-  const [author, setAuthor] = useState(() => isLoggedIn ? { zh: "", en: "" } : DEMO_AUTHOR);
+  const [content, setContent] = useState<ParagraphPair[]>(() => (localUserBoot ? [] : DEMO_CONTENT));
+  const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => (localUserBoot ? null : DEMO_ANALYSIS));
+  const [title, setTitle] = useState(() => (localUserBoot ? { zh: "", en: "" } : DEMO_TITLE));
+  const [author, setAuthor] = useState(() => (localUserBoot ? { zh: "", en: "" } : DEMO_AUTHOR));
   const [isTranslating, setIsTranslating] = useState(false);
   const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -281,8 +302,13 @@ export default function App() {
   const [annotationDraft, setAnnotationDraft] = useState("");
   const [pendingSelection, setPendingSelection] = useState<{ paraIndex: number; startOffset: number; endOffset: number; selectedText: string } | null>(null);
   const [textInput, setTextInput] = useState("");
+  const [originalDocx, setOriginalDocx] = useState<ArrayBuffer | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [currentHistoryId, setCurrentHistoryId] = useState<string | null>(null);
   const [storageMode, setStorageMode] = useState<StorageMode>(() =>
     (localStorage.getItem(STORAGE_MODE_KEY) as StorageMode) || "local"
@@ -294,31 +320,152 @@ export default function App() {
     localStorage.setItem(STORAGE_MODE_KEY, next);
   };
 
-  const handleLogin = (name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    localStorage.setItem(USERNAME_KEY, trimmed);
-    setUsername(trimmed);
-    // Clear demo content, show empty state for logged-in user
-    setContent([]);
-    setAnalysis(null);
-    setTitle({ zh: "", en: "" });
-    setAuthor({ zh: "", en: "" });
-    setAnnotations([]);
-    // Migrate existing history items without username to this user
-    setHistory((prev) => prev.map((item) => item.username ? item : { ...item, username: trimmed }));
-  };
+  const authUserPrevRef = useRef<string | null | undefined>(undefined);
 
-  const handleLogout = () => {
-    localStorage.removeItem(USERNAME_KEY);
-    setUsername(null);
-    setLoginInput("");
-    // Restore demo content
-    setContent(DEMO_CONTENT);
-    setAnalysis(DEMO_ANALYSIS);
-    setTitle(DEMO_TITLE);
-    setAuthor(DEMO_AUTHOR);
-    setAnnotations([]);
+  useLayoutEffect(() => {
+    if (!auth.isLoaded) return;
+    const prev = authUserPrevRef.current;
+    const cur = auth.userId;
+    if (prev === cur) return;
+    authUserPrevRef.current = cur;
+
+    if (cur) {
+      setContent([]);
+      setAnalysis(null);
+      setTitle({ zh: "", en: "" });
+      setAuthor({ zh: "", en: "" });
+      setAnnotations([]);
+      setHistory((h) => h.map((item) => (item.username ? item : { ...item, username: cur })));
+    } else {
+      setContent(DEMO_CONTENT);
+      setAnalysis(DEMO_ANALYSIS);
+      setTitle(DEMO_TITLE);
+      setAuthor(DEMO_AUTHOR);
+      setAnnotations([]);
+    }
+  }, [auth.isLoaded, auth.userId]);
+
+  // ─── Search logic ───
+  interface SearchMatch {
+    paraIndex: number;
+    field: "en" | "zh";
+    startOffset: number;
+    endOffset: number;
+  }
+
+  const searchMatches = useMemo<SearchMatch[]>(() => {
+    if (!searchQuery.trim()) return [];
+    const q = searchQuery.toLowerCase();
+    const matches: SearchMatch[] = [];
+    content.forEach((pair, paraIndex) => {
+      for (const field of ["en", "zh"] as const) {
+        const text = pair[field].toLowerCase();
+        let idx = 0;
+        while ((idx = text.indexOf(q, idx)) !== -1) {
+          matches.push({ paraIndex, field, startOffset: idx, endOffset: idx + q.length });
+          idx += q.length;
+        }
+      }
+    });
+    return matches;
+  }, [searchQuery, content]);
+
+  // Reset match index when matches change
+  useEffect(() => {
+    setCurrentMatchIndex(0);
+  }, [searchMatches.length, searchQuery]);
+
+  // Scroll to current match
+  useEffect(() => {
+    if (searchMatches.length === 0) return;
+    const match = searchMatches[currentMatchIndex];
+    if (!match) return;
+    const el = document.querySelector(`[data-search-match="${currentMatchIndex}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [currentMatchIndex, searchMatches]);
+
+  const goToNextMatch = useCallback(() => {
+    if (searchMatches.length === 0) return;
+    setCurrentMatchIndex((prev) => (prev + 1) % searchMatches.length);
+  }, [searchMatches.length]);
+
+  const goToPrevMatch = useCallback(() => {
+    if (searchMatches.length === 0) return;
+    setCurrentMatchIndex((prev) => (prev - 1 + searchMatches.length) % searchMatches.length);
+  }, [searchMatches.length]);
+
+  const openSearch = useCallback(() => {
+    if (content.length === 0) return;
+    setSearchOpen(true);
+    setTimeout(() => searchInputRef.current?.focus(), 50);
+  }, [content.length]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setCurrentMatchIndex(0);
+  }, []);
+
+  // Keyboard shortcut: Cmd/Ctrl+F
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f" && content.length > 0) {
+        e.preventDefault();
+        openSearch();
+      }
+      if (e.key === "Escape" && searchOpen) {
+        closeSearch();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [content.length, searchOpen, openSearch, closeSearch]);
+
+  // Helper: render text with search highlights
+  // textOffset: when rendering a substring of the full paragraph text, pass the starting offset
+  const renderSearchHighlightedText = (text: string, paraIndex: number, field: "en" | "zh", textOffset: number = 0): React.ReactNode => {
+    if (!searchQuery.trim()) return text;
+    const rangeStart = textOffset;
+    const rangeEnd = textOffset + text.length;
+    const fieldMatches = searchMatches.filter(
+      (m) => m.paraIndex === paraIndex && m.field === field && m.startOffset < rangeEnd && m.endOffset > rangeStart
+    );
+    if (fieldMatches.length === 0) return text;
+
+    const segments: React.ReactNode[] = [];
+    let cursor = 0; // cursor within `text`
+
+    fieldMatches.forEach((match) => {
+      // Clamp match offsets to the text range
+      const mStart = Math.max(match.startOffset - textOffset, 0);
+      const mEnd = Math.min(match.endOffset - textOffset, text.length);
+      if (mStart > cursor) {
+        segments.push(<span key={`s-${cursor}`}>{text.slice(cursor, mStart)}</span>);
+      }
+      const globalIdx = searchMatches.indexOf(match);
+      const isActive = globalIdx === currentMatchIndex;
+      segments.push(
+        <mark
+          key={`m-${mStart}`}
+          data-search-match={globalIdx}
+          className={`rounded-sm transition-colors ${
+            isActive
+              ? "bg-yellow-300/80 ring-2 ring-vibrant-1/50"
+              : "bg-yellow-200/60"
+          }`}
+        >
+          {text.slice(mStart, mEnd)}
+        </mark>
+      );
+      cursor = mEnd;
+    });
+
+    if (cursor < text.length) {
+      segments.push(<span key={`s-${cursor}`}>{text.slice(cursor)}</span>);
+    }
+    return <>{segments}</>;
   };
 
   const changeSourceLang = (lang: SourceLang) => {
@@ -326,28 +473,52 @@ export default function App() {
     localStorage.setItem(SOURCE_LANG_KEY, lang);
   };
 
-  // Filter history by current user; not logged in = no history
-  const userHistory = username ? history.filter((h) => !h.username || h.username === username) : [];
+  const isHistoryAdmin =
+    Boolean(auth.userId) && auth.mode === "clerk" && clerkAdminIdsFromEnv().has(auth.userId!);
+  const historyCap = isHistoryAdmin ? MAX_HISTORY_ADMIN : MAX_HISTORY;
 
-  // 从云端拉取历史（多设备同步），仅云端模式
+  // 普通用户只看自己的；管理员（VITE_CLERK_ADMIN_USER_IDS）看全部
+  const userHistory = !auth.userId
+    ? []
+    : isHistoryAdmin
+      ? history
+      : history.filter((h) => !h.username || h.username === auth.userId);
+
+  // 从云端拉取历史（多设备同步），仅云端模式；Clerk 模式下附带会话 Token
   useEffect(() => {
     if (storageMode !== "cloud") return;
-    fetch("/api/history")
-      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((text) => {
-        try { return JSON.parse(text); } catch { return JSON5.parse(text); }
-      })
-      .then((items: HistoryItem[]) => {
+    if (!auth.isLoaded) return;
+    let cancelled = false;
+    (async () => {
+      const headers: Record<string, string> = {};
+      const t = await auth.getApiToken();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      try {
+        const res = await fetch("/api/history", { headers });
+        const text = await res.text();
+        if (!res.ok || cancelled) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = JSON5.parse(text);
+        }
+        const items = parsed as HistoryItem[];
         if (Array.isArray(items) && items.length > 0) {
-          const sliced = items.slice(0, MAX_HISTORY);
+          const sliced = items.slice(0, historyCap);
           setHistory(sliced);
           try {
             localStorage.setItem(HISTORY_KEY, JSON.stringify(sliced));
           } catch {}
         }
-      })
-      .catch(() => {});
-  }, [storageMode]);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [storageMode, auth.isLoaded, auth.userId, auth.getApiToken, auth.mode, historyCap]);
 
   useEffect(() => {
     try {
@@ -360,16 +531,20 @@ export default function App() {
   const saveToHistory = (item: Omit<HistoryItem, "id" | "createdAt" | "username" | "sourceLang">) => {
     const id = crypto.randomUUID();
     const createdAt = Date.now();
-    const entry: HistoryItem = { ...item, id, createdAt, username: username || undefined, sourceLang };
-    setHistory((prev) => [entry, ...prev.slice(0, MAX_HISTORY - 1)]);
+    const entry: HistoryItem = { ...item, id, createdAt, username: auth.userId || undefined, sourceLang };
+    setHistory((prev) => [entry, ...prev.slice(0, historyCap - 1)]);
 
-    // 仅云端模式时同步到云端
     if (storageMode === "cloud") {
-      fetch("/api/history", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...item, id, createdAt, username: username || undefined, sourceLang }),
-      }).catch(() => {});
+      (async () => {
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        const t = await auth.getApiToken();
+        if (t) headers.Authorization = `Bearer ${t}`;
+        fetch("/api/history", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...item, id, createdAt, username: auth.userId || undefined, sourceLang }),
+        }).catch(() => {});
+      })();
     }
   };
 
@@ -390,9 +565,13 @@ export default function App() {
     e.stopPropagation();
     setHistory((prev) => prev.filter((h) => h.id !== id));
 
-    // 仅云端模式时从云端删除
     if (storageMode === "cloud") {
-      fetch(`/api/history?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+      (async () => {
+        const headers: Record<string, string> = {};
+        const t = await auth.getApiToken();
+        if (t) headers.Authorization = `Bearer ${t}`;
+        fetch(`/api/history?id=${encodeURIComponent(id)}`, { method: "DELETE", headers }).catch(() => {});
+      })();
     }
   };
 
@@ -482,16 +661,16 @@ export default function App() {
   const renderAnnotatedText = (text: string, paraIndex: number) => {
     const paraAnns = getParaAnnotations(paraIndex);
     if (paraAnns.length === 0) {
-      return <span>{text}</span>;
+      return <span>{renderSearchHighlightedText(text, paraIndex, "en")}</span>;
     }
 
     const segments: React.ReactNode[] = [];
     let lastEnd = 0;
 
     paraAnns.forEach((ann) => {
-      // Add plain text before this annotation
+      // Add plain text before this annotation (with search highlight)
       if (ann.startOffset > lastEnd) {
-        segments.push(<span key={`t-${lastEnd}`}>{text.slice(lastEnd, ann.startOffset)}</span>);
+        segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd, ann.startOffset), paraIndex, "en", lastEnd)}</span>);
       }
       // Add highlighted annotation span
       const isActive = activeAnnotationId === ann.id;
@@ -520,9 +699,9 @@ export default function App() {
       lastEnd = ann.endOffset;
     });
 
-    // Add remaining text
+    // Add remaining text (with search highlight)
     if (lastEnd < text.length) {
-      segments.push(<span key={`t-${lastEnd}`}>{text.slice(lastEnd)}</span>);
+      segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd), paraIndex, "en", lastEnd)}</span>);
     }
 
     return <>{segments}</>;
@@ -530,7 +709,7 @@ export default function App() {
 
   const handleExportDocx = async () => {
     const { exportToDocx } = await import("./exportDocx");
-    await exportToDocx({ title, author, content, annotations, analysis });
+    await exportToDocx({ title, author, content, annotations, analysis, originalDocx });
   };
 
   type TranslateResult = { translation: ParagraphPair[]; analysis: ArticleAnalysis; title?: { en: string; zh: string }; author?: { en: string; zh: string } };
@@ -732,12 +911,14 @@ export default function App() {
     try {
       setProgress({ percent: 5, step: "正在解析文档..." });
 
+      setOriginalDocx(null); // reset
       let text = "";
       if (ext === "pdf") {
         const arrayBuffer = await file.arrayBuffer();
         text = await extractPdfText(arrayBuffer);
       } else if (ext === "docx") {
         const arrayBuffer = await file.arrayBuffer();
+        setOriginalDocx(arrayBuffer.slice(0)); // keep a copy
         const result = await mammoth.extractRawText({ arrayBuffer });
         text = result.value;
       } else {
@@ -765,6 +946,7 @@ export default function App() {
     setIsTranslating(true);
     setError(null);
     setAnalysis(null);
+    setOriginalDocx(null); // text input has no original docx
 
     try {
       setProgress({ percent: 10, step: "正在准备翻译..." });
@@ -777,6 +959,14 @@ export default function App() {
       setProgress(null);
     }
   };
+
+  if (auth.mode === "clerk" && !auth.isLoaded) {
+    return (
+      <div className="min-h-screen bg-paper flex items-center justify-center font-sans text-sm text-ink/40">
+        加载中…
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-paper selection:bg-vibrant-1/10 relative">
@@ -812,6 +1002,17 @@ export default function App() {
             />
           </div>
           <div className="flex items-center gap-3">
+            {/* Search button */}
+            {content.length > 0 && (
+              <button
+                onClick={openSearch}
+                className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
+                title="搜索 (⌘F)"
+                aria-label="搜索"
+              >
+                <Search className="w-4.5 h-4.5 text-ink/40 hover:text-vibrant-1 transition-colors" />
+              </button>
+            )}
             {/* Language selector */}
             <div className="relative">
               <select
@@ -835,12 +1036,18 @@ export default function App() {
             >
               <FileDown className="w-5 h-5 hover:text-vibrant-1 transition-colors" />
             </button>
-            {/* User & logout / login */}
-            {username ? (
+            {/* User & logout / login：Clerk 模式走弹窗登录（含密码）；本地模式仅用户名 */}
+            {auth.userId ? (
               <>
-                <span className="text-xs font-sans text-ink/40 hidden sm:inline">{username}</span>
+                <span className="text-xs font-sans text-ink/40 hidden sm:inline max-w-[120px] truncate" title={auth.displayName ?? undefined}>
+                  {auth.displayName}
+                </span>
                 <button
-                  onClick={handleLogout}
+                  type="button"
+                  onClick={() => {
+                    auth.logout();
+                    setLoginInput("");
+                  }}
                   className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
                   title="退出登录"
                   aria-label="退出登录"
@@ -848,9 +1055,23 @@ export default function App() {
                   <LogOut className="w-4 h-4 text-ink/40 hover:text-vibrant-1 transition-colors" />
                 </button>
               </>
+            ) : auth.mode === "clerk" ? (
+              <button
+                type="button"
+                onClick={() => auth.login()}
+                className="px-3 py-1.5 bg-ink text-paper text-[10px] font-sans font-bold uppercase tracking-wider rounded-full hover:bg-vibrant-1 transition-colors"
+              >
+                登录
+              </button>
             ) : (
               <form
-                onSubmit={(e) => { e.preventDefault(); handleLogin(loginInput); }}
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const t = loginInput.trim();
+                  if (!t) return;
+                  auth.login(t);
+                  setLoginInput("");
+                }}
                 className="flex items-center gap-1.5"
               >
                 <input
@@ -858,7 +1079,8 @@ export default function App() {
                   value={loginInput}
                   onChange={(e) => setLoginInput(e.target.value)}
                   placeholder="用户名"
-                  className="w-20 px-2.5 py-1.5 bg-white/60 border border-ink/10 rounded-full text-xs font-sans text-ink/70 placeholder:text-ink/30 outline-none focus:border-vibrant-1/30 transition-colors"
+                  autoComplete="username"
+                  className="w-24 sm:w-28 px-2.5 py-1.5 bg-white/60 border border-ink/10 rounded-full text-xs font-sans text-ink/70 placeholder:text-ink/30 outline-none focus:border-vibrant-1/30 transition-colors"
                 />
                 <button
                   type="submit"
@@ -880,6 +1102,68 @@ export default function App() {
           </div>
         </div>
       </nav>
+
+      {/* Search Bar */}
+      <AnimatePresence>
+        {searchOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            className="sticky top-[64px] z-50 mx-auto max-w-lg px-6 pt-2"
+          >
+            <div className="flex items-center gap-2 bg-white/80 backdrop-blur-2xl border border-ink/10 rounded-2xl shadow-lg px-4 py-2.5">
+              <Search className="w-4 h-4 text-ink/30 shrink-0" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    e.shiftKey ? goToPrevMatch() : goToNextMatch();
+                  }
+                }}
+                placeholder="搜索文章内容..."
+                className="flex-1 bg-transparent outline-none font-sans text-sm text-ink/80 placeholder:text-ink/30"
+                autoFocus
+              />
+              <span className="text-xs font-sans text-ink/40 shrink-0 tabular-nums min-w-[3rem] text-center">
+                {searchQuery.trim()
+                  ? searchMatches.length > 0
+                    ? `${currentMatchIndex + 1}/${searchMatches.length}`
+                    : "0/0"
+                  : ""}
+              </span>
+              <button
+                onClick={goToPrevMatch}
+                disabled={searchMatches.length === 0}
+                className="p-1.5 rounded-lg hover:bg-ink/5 transition-colors disabled:opacity-20"
+                aria-label="上一个"
+              >
+                <ChevronUp className="w-4 h-4" />
+              </button>
+              <button
+                onClick={goToNextMatch}
+                disabled={searchMatches.length === 0}
+                className="p-1.5 rounded-lg hover:bg-ink/5 transition-colors disabled:opacity-20"
+                aria-label="下一个"
+              >
+                <ChevronDown className="w-4 h-4" />
+              </button>
+              <button
+                onClick={closeSearch}
+                className="p-1.5 rounded-lg hover:bg-ink/5 transition-colors"
+                aria-label="关闭搜索"
+              >
+                <X className="w-4 h-4 text-ink/40" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Import Panel — dropdown under nav */}
       <AnimatePresence>
@@ -987,7 +1271,7 @@ export default function App() {
                       <li>系统自动识别语言并翻译，生成双语对照和文学分析</li>
                       <li>在原文中选中文字即可添加批注</li>
                       <li>点击右上角下载图标导出为 Word 文档</li>
-                      <li>输入用户名登录后可管理个人翻译历史</li>
+                      <li>登录后可管理个人翻译历史（配置 Clerk 时使用账号密码；未配置时可用本地用户名）</li>
                     </ol>
                   </div>
 
@@ -1022,7 +1306,12 @@ export default function App() {
               className="fixed left-0 top-0 bottom-0 w-full max-w-md bg-white/95 backdrop-blur-xl border-r border-ink/10 shadow-2xl z-[70] overflow-hidden flex flex-col"
             >
               <div className="flex justify-between items-center px-6 py-5 border-b border-ink/10">
-                <h2 className="font-sans text-sm uppercase tracking-widest font-bold text-ink">历史翻译</h2>
+                <div>
+                  <h2 className="font-sans text-sm uppercase tracking-widest font-bold text-ink">历史翻译</h2>
+                  {isHistoryAdmin && (
+                    <p className="text-[10px] text-vibrant-1 font-sans font-medium mt-1">管理员 · 全部用户记录</p>
+                  )}
+                </div>
                 <button onClick={() => setHistoryOpen(false)} className="p-2 -m-2 rounded-full hover:bg-ink/5">
                   <X className="w-5 h-5" />
                 </button>
@@ -1059,6 +1348,14 @@ export default function App() {
                           <p className="font-serif-zh font-medium text-ink truncate">{item.title.zh || item.title.en || "无标题"}</p>
                           <p className="text-xs text-ink/50 mt-0.5 font-sans">
                             {item.author.zh || item.author.en || "—"} · {new Date(item.createdAt).toLocaleDateString("zh-CN")}
+                            {isHistoryAdmin && item.username && (
+                              <span
+                                className="block text-[10px] text-ink/35 truncate mt-0.5"
+                                title={item.username}
+                              >
+                                用户 {item.ownerDisplayName || item.username}
+                              </span>
+                            )}
                           </p>
                         </div>
                         <button
@@ -1190,7 +1487,7 @@ export default function App() {
 
                     {/* Chinese Side */}
                     <div className="content-text content-text-zh whitespace-pre-wrap">
-                      {pair.zh}
+                      {renderSearchHighlightedText(pair.zh, paraIndex, "zh")}
                     </div>
                   </div>
 
@@ -1460,6 +1757,14 @@ export default function App() {
           </p>
         </footer>
       </main>
+
+      <FloatingTextFollowup
+        hasContent={content.length > 0}
+        content={content}
+        analysis={analysis}
+        title={title}
+        author={author}
+      />
     </div>
   );
 }

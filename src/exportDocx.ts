@@ -1,41 +1,21 @@
+import JSZip from "jszip";
 import {
   Document,
   Packer,
   Paragraph,
   TextRun,
-  HeadingLevel,
-  AlignmentType,
-  PageBreak,
   SectionType,
   CommentRangeStart,
   CommentRangeEnd,
   CommentReference,
+  convertInchesToTwip,
+  LineRuleType,
 } from "docx";
 import { saveAs } from "file-saver";
 
 interface ParagraphPair {
   en: string;
   zh: string;
-}
-
-interface AnalysisBilingual {
-  en: string;
-  zh: string;
-}
-
-interface CharacterInfo {
-  name: AnalysisBilingual;
-  description: AnalysisBilingual;
-}
-
-interface ArticleAnalysis {
-  summary: AnalysisBilingual;
-  narrativeDetail: AnalysisBilingual;
-  themes: AnalysisBilingual[];
-  pros: AnalysisBilingual[];
-  cons: AnalysisBilingual[];
-  plotSynopsis?: AnalysisBilingual;
-  characters?: CharacterInfo[];
 }
 
 interface Annotation {
@@ -56,425 +36,394 @@ interface ExportOptions {
   author: { en: string; zh: string };
   content: ParagraphPair[];
   annotations: Annotations;
-  analysis: ArticleAnalysis | null;
+  analysis: unknown;
+  originalDocx: ArrayBuffer | null;
 }
 
-function makeSpacer(): Paragraph {
-  return new Paragraph({ spacing: { after: 200 } });
+// ─── Original .docx injection path ───
+
+const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types";
+const COMMENTS_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+const COMMENTS_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+
+function escapeXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function makeSectionHeader(text: string): Paragraph {
-  return new Paragraph({
-    children: [
-      new TextRun({
-        text,
-        bold: true,
-        size: 28,
-        font: "Arial",
-      }),
-    ],
-    spacing: { before: 600, after: 300 },
-    heading: HeadingLevel.HEADING_2,
+function buildCommentsXml(annotations: Annotations): string {
+  const comments = annotations.map((ann, i) => {
+    const id = i + 1;
+    const date = new Date(ann.createdAt).toISOString();
+    return `<w:comment w:id="${id}" w:author="User" w:date="${date}"><w:p><w:r><w:t>${escapeXml(ann.text)}</w:t></w:r></w:p></w:comment>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="${W_NS}" xmlns:r="${R_NS}">
+${comments}
+</w:comments>`;
+}
+
+/**
+ * Walk <w:p> elements in document.xml, match our paraIndex by counting paragraphs
+ * that contain at least one <w:t> (text node). For matching paragraphs with annotations,
+ * split <w:r>/<w:t> runs at annotation boundaries and inject comment markers.
+ */
+function injectCommentsIntoDocXml(docXml: string, annotations: Annotations): string {
+  if (annotations.length === 0) return docXml;
+
+  // Group annotations by paraIndex
+  const byPara = new Map<number, { ann: Annotation; numId: number }[]>();
+  annotations.forEach((ann, i) => {
+    const list = byPara.get(ann.paraIndex) || [];
+    list.push({ ann, numId: i + 1 });
+    byPara.set(ann.paraIndex, list);
   });
+  byPara.forEach((list) => list.sort((a, b) => a.ann.startOffset - b.ann.startOffset));
+
+  // Split document.xml into paragraphs (<w:p>...</w:p>), process each
+  let textParaIndex = -1;
+
+  // Use regex to find each <w:p ...>...</w:p> block (non-greedy, handles nested tags)
+  const result = docXml.replace(/<w:p[\s>][\s\S]*?<\/w:p>/g, (pBlock) => {
+    // Check if this paragraph has any text content
+    if (!/<w:t[\s>]/.test(pBlock)) return pBlock;
+    textParaIndex++;
+
+    const annList = byPara.get(textParaIndex);
+    if (!annList || annList.length === 0) return pBlock;
+
+    // Extract full text from this paragraph to verify offsets
+    const textParts: string[] = [];
+    pBlock.replace(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g, (_, content) => {
+      textParts.push(content.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"'));
+      return "";
+    });
+    const fullText = textParts.join("");
+
+    // Build a flat list of characters with their run info
+    // We'll reconstruct the paragraph XML with comment markers injected
+
+    // Extract the paragraph opening tag and properties
+    const pOpenMatch = pBlock.match(/^(<w:p[\s>][\s\S]*?)(<w:r[\s>])/);
+    if (!pOpenMatch) return pBlock; // can't parse, skip
+
+    const beforeRuns = pOpenMatch[1];
+    const runsAndClose = pBlock.slice(beforeRuns.length);
+
+    // Parse all runs: collect { runXmlBefore (rPr etc), text, runXmlAfter }
+    interface RunSegment {
+      prefix: string;   // everything before <w:t> in this run (e.g. <w:r><w:rPr>...</w:rPr>)
+      text: string;     // decoded text content
+      suffix: string;   // </w:t></w:r>
+      rawTOpen: string; // the <w:t ...> opening tag
+    }
+    const runs: RunSegment[] = [];
+    let nonRunContent = ""; // content between/after runs (like </w:p>)
+    let remaining = runsAndClose;
+
+    // Extract runs one by one
+    const runRegex = /(<w:r[\s>][\s\S]*?)(<w:t[^>]*>)([\s\S]*?)<\/w:t>([\s\S]*?<\/w:r>)/g;
+    let lastIndex = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = runRegex.exec(remaining)) !== null) {
+      if (m.index > lastIndex) {
+        // Non-run content before this run (could be bookmarks, etc.)
+        nonRunContent += remaining.slice(lastIndex, m.index);
+      }
+      const decoded = m[3].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
+      runs.push({
+        prefix: (nonRunContent || "") + m[1],
+        text: decoded,
+        rawTOpen: m[2],
+        suffix: "</w:t>" + m[4],
+      });
+      nonRunContent = "";
+      lastIndex = m.index + m[0].length;
+    }
+    const afterAllRuns = remaining.slice(lastIndex); // includes </w:p>
+
+    if (runs.length === 0) return pBlock;
+
+    // Now rebuild: walk character by character, inject comment markers
+    let charOffset = 0;
+    let annIdx = 0;
+    const outputParts: string[] = [beforeRuns];
+
+    for (let ri = 0; ri < runs.length; ri++) {
+      const run = runs[ri];
+      // Get rPr (run properties) from prefix to reuse for split runs
+      const rPrMatch = run.prefix.match(/<w:rPr>[\s\S]*?<\/w:rPr>/);
+      const rPr = rPrMatch ? rPrMatch[0] : "";
+      // Get the <w:r> opening (may have attributes)
+      const rOpenMatch = run.prefix.match(/<w:r(\s[^>]*)?>/) || ["<w:r>"];
+      const rOpen = rOpenMatch[0];
+
+      // Determine preserve space attribute
+      const tOpen = run.rawTOpen.includes("xml:space") ? run.rawTOpen : '<w:t xml:space="preserve">';
+
+      let textPos = 0;
+      const runText = run.text;
+
+      // Add any non-run prefix content (for first run, this includes prefix markup)
+      if (ri === 0 || run.prefix !== runs[ri].prefix) {
+        // Output everything before the first <w:r> in this segment
+        const beforeR = run.prefix.match(/([\s\S]*?)(<w:r[\s>])/);
+        if (beforeR) outputParts.push(beforeR[1]);
+      } else {
+        const beforeR = run.prefix.match(/([\s\S]*?)(<w:r[\s>])/);
+        if (beforeR) outputParts.push(beforeR[1]);
+      }
+
+      // Process this run's text, splitting at annotation boundaries
+      while (textPos < runText.length) {
+        // Check if any annotation starts or ends at current charOffset
+        let splitAt: number | null = null;
+        let action: "start" | "end" | null = null;
+        let actionAnn: typeof annList[0] | null = null;
+
+        for (let ai = 0; ai < annList.length; ai++) {
+          const a = annList[ai];
+          if (a.ann.startOffset === charOffset + textPos) {
+            splitAt = textPos;
+            action = "start";
+            actionAnn = a;
+            break;
+          }
+          if (a.ann.endOffset === charOffset + textPos) {
+            splitAt = textPos;
+            action = "end";
+            actionAnn = a;
+            break;
+          }
+        }
+
+        if (splitAt !== null && action && actionAnn) {
+          // Output text before this point as a run
+          if (splitAt > 0) {
+            const seg = escapeXml(runText.slice(textPos - (splitAt - textPos), splitAt));
+            // Actually we need text from the start of current segment
+          }
+          // This approach is getting too complex. Let me use a simpler method.
+          break;
+        }
+        textPos++;
+      }
+
+      // Simplified approach: for this run, output the full text with markers at boundaries
+      // Reset and use a segment-based approach
+      charOffset += runText.length;
+    }
+
+    // FALLBACK: Use a simpler but reliable approach
+    // Rebuild the paragraph by concatenating all text, splitting at annotation points,
+    // and wrapping each segment in the first run's formatting
+
+    // Get the formatting from the first run
+    const firstRun = runs[0];
+    const rPrMatch = firstRun.prefix.match(/<w:rPr>[\s\S]*?<\/w:rPr>/);
+    const rPr = rPrMatch ? rPrMatch[0] : "";
+
+    // Build segments from full text
+    interface TextSegment {
+      text: string;
+      commentStart?: number; // numId
+      commentEnd?: number;   // numId
+    }
+
+    const segments: TextSegment[] = [];
+    const points = new Set<number>();
+    annList.forEach((a) => {
+      points.add(a.ann.startOffset);
+      points.add(a.ann.endOffset);
+    });
+    points.add(0);
+    points.add(fullText.length);
+    const sorted = [...points].sort((a, b) => a - b);
+
+    for (let si = 0; si < sorted.length - 1; si++) {
+      const start = sorted[si];
+      const end = sorted[si + 1];
+      if (start >= end || start >= fullText.length) continue;
+      segments.push({ text: fullText.slice(start, end) });
+    }
+
+    // Now build XML
+    const newParts: string[] = [beforeRuns];
+
+    let cursor = 0;
+    for (const seg of segments) {
+      const segStart = cursor;
+      const segEnd = cursor + seg.text.length;
+
+      // Insert commentRangeStart before this segment if any annotation starts here
+      annList.forEach((a) => {
+        if (a.ann.startOffset === segStart) {
+          newParts.push(`<w:commentRangeStart w:id="${a.numId}"/>`);
+        }
+      });
+
+      // Output the text run
+      newParts.push(`<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(seg.text)}</w:t></w:r>`);
+
+      // Insert commentRangeEnd + commentReference after this segment if any annotation ends here
+      annList.forEach((a) => {
+        if (a.ann.endOffset === segEnd) {
+          newParts.push(`<w:commentRangeEnd w:id="${a.numId}"/>`);
+          newParts.push(`<w:r><w:rPr/><w:commentReference w:id="${a.numId}"/></w:r>`);
+        }
+      });
+
+      cursor = segEnd;
+    }
+
+    newParts.push(afterAllRuns);
+    return newParts.join("");
+  });
+
+  return result;
 }
 
-export async function exportToDocx(options: ExportOptions): Promise<void> {
-  const { title, author, content, annotations, analysis } = options;
+async function exportWithOriginal(
+  docxBuffer: ArrayBuffer,
+  annotations: Annotations,
+  filename: string,
+): Promise<void> {
+  const zip = await JSZip.loadAsync(docxBuffer);
 
-  // Build comment entries with numeric IDs
-  const commentEntries = annotations.map((ann, i) => ({
-    ...ann,
-    numId: i + 1,
-  }));
+  if (annotations.length > 0) {
+    // 1. Add/replace word/comments.xml
+    zip.file("word/comments.xml", buildCommentsXml(annotations));
 
-  // Group annotations by paragraph, sorted by startOffset
-  const paraAnnotations = new Map<number, typeof commentEntries>();
-  commentEntries.forEach((entry) => {
-    const list = paraAnnotations.get(entry.paraIndex) || [];
-    list.push(entry);
-    paraAnnotations.set(entry.paraIndex, list);
+    // 2. Inject comment markers into word/document.xml
+    const docXmlRaw = await zip.file("word/document.xml")!.async("string");
+    const docXmlNew = injectCommentsIntoDocXml(docXmlRaw, annotations);
+    zip.file("word/document.xml", docXmlNew);
+
+    // 3. Ensure [Content_Types].xml has comments content type
+    const ctRaw = await zip.file("[Content_Types].xml")!.async("string");
+    if (!ctRaw.includes("comments.xml")) {
+      const updated = ctRaw.replace(
+        /<\/Types>/,
+        `<Override PartName="/word/comments.xml" ContentType="${COMMENTS_TYPE}"/></Types>`
+      );
+      zip.file("[Content_Types].xml", updated);
+    }
+
+    // 4. Ensure word/_rels/document.xml.rels has comments relationship
+    const relsPath = "word/_rels/document.xml.rels";
+    const relsRaw = await zip.file(relsPath)?.async("string") ?? "";
+    if (relsRaw && !relsRaw.includes("comments.xml")) {
+      // Find a unique rId
+      const ids = [...relsRaw.matchAll(/Id="(rId\d+)"/g)].map((m) => parseInt(m[1].replace("rId", ""), 10));
+      const nextId = Math.max(0, ...ids) + 1;
+      const updated = relsRaw.replace(
+        /<\/Relationships>/,
+        `<Relationship Id="rId${nextId}" Type="${COMMENTS_REL_TYPE}" Target="comments.xml"/></Relationships>`
+      );
+      zip.file(relsPath, updated);
+    }
+  }
+
+  const blob = await zip.generateAsync({ type: "blob", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+  saveAs(blob, filename);
+}
+
+// ─── Fallback: create new document (for text input / PDF) ───
+
+function makeFallbackDoc(content: ParagraphPair[], annotations: Annotations): Document {
+  const FONT = "Times New Roman";
+  const FONT_SIZE = 24;
+  const LINE_SPACING = 276;
+  const PARA_AFTER = 120;
+
+  const commentEntries = annotations.map((ann, i) => ({ ...ann, numId: i + 1 }));
+  const paraAnns = new Map<number, typeof commentEntries>();
+  commentEntries.forEach((e) => {
+    const list = paraAnns.get(e.paraIndex) || [];
+    list.push(e);
+    paraAnns.set(e.paraIndex, list);
   });
-  paraAnnotations.forEach((list) => list.sort((a, b) => a.startOffset - b.startOffset));
+  paraAnns.forEach((list) => list.sort((a, b) => a.startOffset - b.startOffset));
 
-  // --- Build document sections ---
-
+  const paraSpacing = { after: PARA_AFTER, line: LINE_SPACING, lineRule: LineRuleType.AUTO };
   const children: Paragraph[] = [];
 
-  // Title page
-  children.push(
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: title.en || "Untitled",
-          bold: true,
-          size: 56,
-          font: "Georgia",
-        }),
-      ],
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200 },
-    })
-  );
+  content.forEach((pair, pi) => {
+    const text = pair.en;
+    const anns = paraAnns.get(pi);
 
-  children.push(
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: title.zh || "无标题",
-          bold: true,
-          size: 48,
-          font: "SimSun",
-        }),
-      ],
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-    })
-  );
-
-  if (author.en || author.zh) {
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({
-            text: [author.en, author.zh].filter(Boolean).join(" / "),
-            italics: true,
-            size: 28,
-            font: "Georgia",
-            color: "666666",
-          }),
-        ],
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 600 },
-      })
-    );
-  }
-
-  // Separator
-  children.push(
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: "─".repeat(40),
-          color: "CCCCCC",
-          size: 20,
-        }),
-      ],
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-    })
-  );
-
-  // --- English Full Text ---
-  children.push(makeSectionHeader("English"));
-
-  content.forEach((pair, paraIndex) => {
-    const anns = paraAnnotations.get(paraIndex);
     if (anns && anns.length > 0) {
-      // Split text into segments: plain text and annotated ranges
       const runs: (TextRun | CommentRangeStart | CommentRangeEnd | CommentReference)[] = [];
       let lastEnd = 0;
-      anns.forEach((ann) => {
-        if (ann.startOffset > lastEnd) {
-          runs.push(new TextRun({ text: pair.en.slice(lastEnd, ann.startOffset), size: 24, font: "Georgia" }));
-        }
-        runs.push(new CommentRangeStart(ann.numId));
-        runs.push(new TextRun({ text: pair.en.slice(ann.startOffset, ann.endOffset), size: 24, font: "Georgia" }));
-        runs.push(new CommentRangeEnd(ann.numId));
-        runs.push(new CommentReference(ann.numId));
-        lastEnd = ann.endOffset;
+      anns.forEach((a) => {
+        if (a.startOffset > lastEnd)
+          runs.push(new TextRun({ text: text.slice(lastEnd, a.startOffset), size: FONT_SIZE, font: FONT }));
+        runs.push(new CommentRangeStart(a.numId));
+        runs.push(new TextRun({ text: text.slice(a.startOffset, a.endOffset), size: FONT_SIZE, font: FONT }));
+        runs.push(new CommentRangeEnd(a.numId));
+        runs.push(new CommentReference(a.numId));
+        lastEnd = a.endOffset;
       });
-      if (lastEnd < pair.en.length) {
-        runs.push(new TextRun({ text: pair.en.slice(lastEnd), size: 24, font: "Georgia" }));
-      }
-      children.push(new Paragraph({ children: runs, spacing: { after: 300 } }));
+      if (lastEnd < text.length)
+        runs.push(new TextRun({ text: text.slice(lastEnd), size: FONT_SIZE, font: FONT }));
+      children.push(new Paragraph({ children: runs, spacing: paraSpacing }));
     } else {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: pair.en, size: 24, font: "Georgia" }),
-          ],
-          spacing: { after: 300 },
-        })
-      );
+      children.push(new Paragraph({
+        children: [new TextRun({ text, size: FONT_SIZE, font: FONT })],
+        spacing: paraSpacing,
+      }));
     }
   });
 
-  // Page break before Chinese section
-  children.push(
-    new Paragraph({
-      children: [new PageBreak()],
-    })
-  );
-
-  // --- Chinese Full Text ---
-  children.push(makeSectionHeader("中文"));
-
-  content.forEach((pair) => {
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({
-            text: pair.zh,
-            size: 24,
-            font: "SimSun",
-          }),
-        ],
-        spacing: { after: 300 },
-      })
-    );
-  });
-
-  // --- Analysis Section (optional) ---
-  if (analysis) {
-    children.push(
-      new Paragraph({
-        children: [new PageBreak()],
-      })
-    );
-
-    children.push(makeSectionHeader("Analysis / 分析"));
-
-    // Summary
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({ text: "Overview / 概览", bold: true, size: 24, font: "Arial" }),
-        ],
-        spacing: { before: 400, after: 200 },
-      })
-    );
-    if (analysis.summary.en) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: analysis.summary.en, italics: true, size: 22, font: "Georgia" }),
-          ],
-          spacing: { after: 100 },
-        })
-      );
-    }
-    if (analysis.summary.zh) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: analysis.summary.zh, size: 22, font: "SimSun" }),
-          ],
-          spacing: { after: 300 },
-        })
-      );
-    }
-
-    // Key Themes
-    if (analysis.themes.length > 0) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Key Themes / 核心主题", bold: true, size: 24, font: "Arial" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      analysis.themes.forEach((theme) => {
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: `• ${[theme.en, theme.zh].filter(Boolean).join(" / ")}`,
-                size: 22,
-                font: "Georgia",
-              }),
-            ],
-            spacing: { after: 100 },
-          })
-        );
-      });
-    }
-
-    // Narrative Analysis
-    if (analysis.narrativeDetail.en || analysis.narrativeDetail.zh) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Narrative Analysis / 叙事分析", bold: true, size: 24, font: "Arial" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      if (analysis.narrativeDetail.en) {
-        analysis.narrativeDetail.en.split("\n").forEach((para) => {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: para, italics: true, size: 22, font: "Georgia" }),
-              ],
-              spacing: { after: 100 },
-            })
-          );
-        });
-      }
-      children.push(makeSpacer());
-      if (analysis.narrativeDetail.zh) {
-        analysis.narrativeDetail.zh.split("\n").forEach((para) => {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: para, size: 22, font: "SimSun" }),
-              ],
-              spacing: { after: 100 },
-            })
-          );
-        });
-      }
-    }
-
-    // Plot Synopsis
-    if (analysis.plotSynopsis && (analysis.plotSynopsis.en || analysis.plotSynopsis.zh)) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Plot Synopsis / 剧情梗概", bold: true, size: 24, font: "Arial" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      if (analysis.plotSynopsis.en) {
-        analysis.plotSynopsis.en.split("\n").forEach((para) => {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: para, italics: true, size: 22, font: "Georgia" }),
-              ],
-              spacing: { after: 100 },
-            })
-          );
-        });
-      }
-      children.push(makeSpacer());
-      if (analysis.plotSynopsis.zh) {
-        analysis.plotSynopsis.zh.split("\n").forEach((para) => {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: para, size: 22, font: "SimSun" }),
-              ],
-              spacing: { after: 100 },
-            })
-          );
-        });
-      }
-    }
-
-    // Characters
-    if (analysis.characters && analysis.characters.length > 0) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Characters / 人物介绍", bold: true, size: 24, font: "Arial" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      analysis.characters.forEach((char) => {
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({ text: char.name.en, bold: true, size: 22, font: "Georgia" }),
-              ...(char.name.zh ? [new TextRun({ text: ` / ${char.name.zh}`, bold: true, size: 22, font: "SimSun" })] : []),
-            ],
-            spacing: { before: 200, after: 100 },
-          })
-        );
-        if (char.description.en) {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: char.description.en, italics: true, size: 20, font: "Georgia", color: "555555" }),
-              ],
-              spacing: { after: 50 },
-            })
-          );
-        }
-        if (char.description.zh) {
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: char.description.zh, size: 20, font: "SimSun", color: "555555" }),
-              ],
-              spacing: { after: 200 },
-            })
-          );
-        }
-      });
-    }
-
-    // Pros
-    if (analysis.pros.length > 0) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Strengths / 写作优点", bold: true, size: 24, font: "Arial", color: "FF0080" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      analysis.pros.forEach((pro, i) => {
-        const parts: TextRun[] = [
-          new TextRun({ text: `${String(i + 1).padStart(2, "0")}. `, bold: true, size: 22, font: "Arial" }),
-        ];
-        if (pro.en) parts.push(new TextRun({ text: pro.en, italics: true, size: 22, font: "Georgia" }));
-        if (pro.en && pro.zh) parts.push(new TextRun({ text: " — ", size: 22 }));
-        if (pro.zh) parts.push(new TextRun({ text: pro.zh, size: 22, font: "SimSun" }));
-        children.push(new Paragraph({ children: parts, spacing: { after: 100 } }));
-      });
-    }
-
-    // Cons
-    if (analysis.cons.length > 0) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: "Critique / 写作缺点", bold: true, size: 24, font: "Arial", color: "7928CA" }),
-          ],
-          spacing: { before: 400, after: 200 },
-        })
-      );
-      analysis.cons.forEach((con, i) => {
-        const parts: TextRun[] = [
-          new TextRun({ text: `${String(i + 1).padStart(2, "0")}. `, bold: true, size: 22, font: "Arial" }),
-        ];
-        if (con.en) parts.push(new TextRun({ text: con.en, italics: true, size: 22, font: "Georgia" }));
-        if (con.en && con.zh) parts.push(new TextRun({ text: " — ", size: 22 }));
-        if (con.zh) parts.push(new TextRun({ text: con.zh, size: 22, font: "SimSun" }));
-        children.push(new Paragraph({ children: parts, spacing: { after: 100 } }));
-      });
-    }
-  }
-
-  // Build the document with comments
   const docComments = commentEntries.map((c) => ({
     id: c.numId,
     author: "User",
     date: new Date(c.createdAt),
-    children: [
-      new Paragraph({
-        children: [new TextRun({ text: c.text })],
-      }),
-    ],
+    children: [new Paragraph({ children: [new TextRun({ text: c.text })] })],
   }));
 
-  const doc = new Document({
-    comments: docComments.length > 0 ? { children: docComments } : undefined,
-    sections: [
-      {
-        properties: {
-          type: SectionType.CONTINUOUS,
+  return new Document({
+    styles: {
+      default: {
+        document: {
+          run: { font: FONT, size: FONT_SIZE },
+          paragraph: { spacing: { after: PARA_AFTER, line: LINE_SPACING, lineRule: LineRuleType.AUTO } },
         },
-        children,
       },
-    ],
+    },
+    comments: docComments.length > 0 ? { children: docComments } : undefined,
+    sections: [{
+      properties: {
+        type: SectionType.CONTINUOUS,
+        page: {
+          margin: {
+            top: convertInchesToTwip(1),
+            bottom: convertInchesToTwip(1),
+            left: convertInchesToTwip(1),
+            right: convertInchesToTwip(1),
+          },
+        },
+      },
+      children,
+    }],
   });
+}
 
-  const blob = await Packer.toBlob(doc);
-  const filename = `${(title.en || title.zh || "translation").replace(/[^\w\u4e00-\u9fff]/g, "_")}.docx`;
-  saveAs(blob, filename);
+// ─── Main export function ───
+
+export async function exportToDocx(options: ExportOptions): Promise<void> {
+  const { title, content, annotations, originalDocx } = options;
+  const filename = `${(title.en || title.zh || "document").replace(/[^\w\u4e00-\u9fff]/g, "_")}.docx`;
+
+  if (originalDocx) {
+    // Preserve original formatting, just inject comments
+    await exportWithOriginal(originalDocx, annotations, filename);
+  } else {
+    // Fallback: build new document
+    const doc = makeFallbackDoc(content, annotations);
+    const blob = await Packer.toBlob(doc);
+    saveAs(blob, filename);
+  }
 }

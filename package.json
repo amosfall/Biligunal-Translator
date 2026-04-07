@@ -10,9 +10,12 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "start": "concurrently \"npm run server\" \"npm run dev\""
+    "start": "concurrently \"npm run server\" \"npm run dev\"",
+    "merge-history": "tsx scripts/merge-history-username.ts"
   },
   "dependencies": {
+    "@clerk/backend": "^3.2.7",
+    "@clerk/clerk-react": "^5.61.4",
     "@google/genai": "^1.29.0",
     "@neondatabase/serverless": "^1.0.2",
     "@tailwindcss/vite": "^4.1.14",

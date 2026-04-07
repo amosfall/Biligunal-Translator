@@ -1,5 +1,7 @@
 import dotenv from 'dotenv';
 import express from 'express';
+import { verifyToken } from '@clerk/backend';
+import { resolveOwnerDisplayNames } from './lib/clerkUserDisplay.ts';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -59,7 +61,7 @@ const allowOrigin = (origin: string | undefined): string => {
 };
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', allowOrigin(req.headers.origin));
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   next();
 });
 
@@ -344,6 +346,107 @@ function mergeTranslation(
   });
 }
 
+const FOLLOWUP_CONTEXT_MAX = 28000;
+const FOLLOWUP_ANALYSIS_MAX = 12000;
+
+function truncateFollowupContext(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}\n\n[... 内容已截断 ...]`;
+}
+
+function buildFollowupArticleContext(
+  content: { en: string; zh: string }[],
+  title: { en: string; zh: string } | undefined,
+  author: { en: string; zh: string } | undefined,
+  analysis: unknown
+): string {
+  const parts: string[] = [];
+  if (title && (title.en || title.zh)) {
+    parts.push(`标题 / Title\nZH: ${title.zh || '—'}\nEN: ${title.en || '—'}`);
+  }
+  if (author && (author.en || author.zh)) {
+    parts.push(`作者 / Author\nZH: ${author.zh || '—'}\nEN: ${author.en || '—'}`);
+  }
+  const paras = content
+    .map((p, i) => `--- 段落 ${i + 1} ---\n[EN]\n${p.en || ''}\n\n[ZH]\n${p.zh || ''}`)
+    .join('\n\n');
+  parts.push(`正文 / Body\n${paras}`);
+  if (analysis != null && analysis !== '') {
+    try {
+      const raw = typeof analysis === 'string' ? analysis : JSON.stringify(analysis);
+      parts.push(`已有结构化分析（供参考）\n${truncateFollowupContext(raw, FOLLOWUP_ANALYSIS_MAX)}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  return truncateFollowupContext(parts.join('\n\n'), FOLLOWUP_CONTEXT_MAX);
+}
+
+type FollowupHistoryItem =
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; zh?: string; en?: string; content?: string };
+
+function buildFollowupHistoryText(history: FollowupHistoryItem[] | undefined): string {
+  if (!Array.isArray(history) || history.length === 0) return '';
+  const lines: string[] = [];
+  for (const h of history.slice(-12)) {
+    if (h.role === 'user' && typeof h.content === 'string' && h.content.trim()) {
+      lines.push(`用户：${h.content.trim()}`);
+    } else if (h.role === 'assistant') {
+      const zh = (h.zh || '').trim();
+      const en = (h.en || '').trim();
+      const fallback = (h.content || '').trim();
+      if (zh || en) lines.push(`助手：\n中文：${zh || '—'}\nEnglish：${en || '—'}`);
+      else if (fallback) lines.push(`助手：${fallback}`);
+    }
+  }
+  return lines.join('\n\n');
+}
+
+async function callDeepSeekTextFollowup(userPrompt: string, apiKey: string): Promise<{ zh: string; en: string }> {
+  const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [
+        {
+          role: 'system',
+          content:
+            '你是专业的中英双语文学编辑助手。用户会提供文章正文（含英中对照）、可选的结构化分析摘要、以及此前的对话摘录。你必须仅依据这些内容回答用户关于文本的深度追问，不要编造文中不存在的情节或引用。若问题与文本明显无关，请礼貌说明并引导回到文本。\n请始终只输出一个 JSON 对象，且必须包含键 "zh"（简体中文）与 "en"（英文），两者语义一致，风格为文学评论。',
+        },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 4096,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.error('DeepSeek follow-up error:', response.status, text);
+    let userMsg = 'DeepSeek API 调用失败';
+    try {
+      const errJson = JSON.parse(text);
+      const apiErr = errJson?.error?.message || errJson?.message || errJson?.error;
+      if (apiErr) userMsg = typeof apiErr === 'string' ? apiErr : String(apiErr);
+      if (response.status === 401) userMsg = 'API Key 无效或已过期，请检查 .env.local 中的 DEEPSEEK_API_KEY';
+      else if (response.status === 429) userMsg = '请求过于频繁，请稍后再试';
+    } catch {}
+    throw new Error(userMsg);
+  }
+
+  const data = await response.json();
+  const obj = parseDeepSeekJson(data.choices?.[0]?.message?.content ?? '');
+  const zh = typeof obj.zh === 'string' ? obj.zh.trim() : '';
+  const en = typeof obj.en === 'string' ? obj.en.trim() : '';
+  if (!zh && !en) throw new Error('模型未返回有效回答');
+  return { zh: zh || en, en: en || zh };
+}
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.post('/api/extract-text', upload.single('file'), async (req, res) => {
@@ -514,6 +617,49 @@ app.post('/api/translate-stream', async (req, res) => {
   }
 });
 
+app.post('/api/text-followup', async (req, res) => {
+  const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
+  const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
+  if (!DEEPSEEK_API_KEY || placeholders.some(p => DEEPSEEK_API_KEY.includes(p))) {
+    return res.status(503).json({
+      error: '请先配置 DeepSeek API Key。在 bilingual-editorial 目录下创建 .env.local，填写：DEEPSEEK_API_KEY=你的密钥',
+    });
+  }
+
+  try {
+    const body = req.body as {
+      question?: string;
+      content?: { en: string; zh: string }[];
+      title?: { en: string; zh: string };
+      author?: { en: string; zh: string };
+      analysis?: unknown;
+      history?: FollowupHistoryItem[];
+    };
+    const question = typeof body?.question === 'string' ? body.question.trim() : '';
+    if (!question) return res.status(400).json({ error: 'question 不能为空' });
+    const content = Array.isArray(body?.content) ? body.content : [];
+    if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
+
+    const articleCtx = buildFollowupArticleContext(
+      content,
+      body.title,
+      body.author,
+      body.analysis ?? null
+    );
+    const histText = buildFollowupHistoryText(body.history);
+    const userPrompt = ['【文章与背景】', articleCtx, histText ? `【此前对话】\n${histText}` : '', '【当前问题】', question]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const reply = await callDeepSeekTextFollowup(userPrompt, DEEPSEEK_API_KEY);
+    return res.json({ reply });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    console.error(err);
+    return res.status(500).json({ error: msg });
+  }
+});
+
 // 历史记录（多设备同步，需 DATABASE_URL）
 const TABLE_SQL = `CREATE TABLE IF NOT EXISTS translations (
   id TEXT PRIMARY KEY,
@@ -548,10 +694,50 @@ async function withHistoryDb<T>(fn: (sql: ReturnType<typeof neon>) => Promise<T>
   }
 }
 
-app.get('/api/history', async (_req, res) => {
+type ClerkHistoryAuth = 'legacy' | { userId: string } | 'unauthorized';
+
+async function resolveClerkHistoryUser(req: express.Request): Promise<ClerkHistoryAuth> {
+  const secret = (process.env.CLERK_SECRET_KEY || '').trim();
+  if (!secret) return 'legacy';
+  const raw = req.headers.authorization;
+  const token = raw?.startsWith('Bearer ') ? raw.slice(7) : null;
+  if (!token) return 'unauthorized';
+  try {
+    const payload = await verifyToken(token, { secretKey: secret });
+    const sub = payload.sub;
+    if (typeof sub !== 'string' || !sub) return 'unauthorized';
+    return { userId: sub };
+  } catch {
+    return 'unauthorized';
+  }
+}
+
+function getClerkHistoryAdminIds(): Set<string> {
+  const raw = (process.env.CLERK_ADMIN_USER_IDS || '').trim();
+  if (!raw) return new Set();
+  return new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+}
+
+function isClerkHistoryAdmin(userId: string): boolean {
+  return getClerkHistoryAdminIds().has(userId);
+}
+
+app.get('/api/history', async (req, res) => {
+  const auth = await resolveClerkHistoryUser(req);
+  if (auth === 'unauthorized') {
+    return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+  }
+  const admin = auth !== 'legacy' && isClerkHistoryAdmin(auth.userId);
   const result = await withHistoryDb(async (sql) => {
-    const rows = await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
-      FROM translations ORDER BY created_at_ms DESC LIMIT 100`;
+    const rows =
+      auth === 'legacy'
+        ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+            FROM translations ORDER BY created_at_ms DESC LIMIT 100`
+        : admin
+          ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+              FROM translations ORDER BY created_at_ms DESC LIMIT 500`
+          : await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+              FROM translations WHERE username = ${auth.userId} ORDER BY created_at_ms DESC LIMIT 100`;
     return rows as Record<string, unknown>[];
   });
   if (result === null) return res.status(503).json({ error: '历史同步未配置。在 .env.local 添加 DATABASE_URL 或在 Vercel 连接 Neon。' });
@@ -566,10 +752,22 @@ app.get('/api/history', async (_req, res) => {
     username: r.username ? String(r.username) : undefined,
     sourceLang: r.source_lang ? String(r.source_lang) : undefined,
   }));
-  return res.json(items);
+  const labelMap = await resolveOwnerDisplayNames(
+    items.map((i) => i.username),
+    (process.env.CLERK_SECRET_KEY || '').trim()
+  );
+  const enriched = items.map((it) => ({
+    ...it,
+    ownerDisplayName: it.username ? (labelMap.get(it.username) ?? it.username) : undefined,
+  }));
+  return res.json(enriched);
 });
 
 app.post('/api/history', async (req, res) => {
+  const auth = await resolveClerkHistoryUser(req);
+  if (auth === 'unauthorized') {
+    return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+  }
   const body = req.body as {
     id?: string; createdAt?: number;
     title?: { zh: string; en: string }; author?: { zh: string; en: string };
@@ -585,7 +783,7 @@ app.post('/api/history', async (req, res) => {
   const content = Array.isArray(body?.content) ? body.content : [];
   const analysis = body?.analysis ?? null;
   const annotations = body?.annotations ?? null;
-  const dbUsername = body?.username || null;
+  const dbUsername = auth !== 'legacy' ? auth.userId : (body?.username || null);
   const dbSourceLang = body?.sourceLang || null;
   if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
@@ -608,10 +806,20 @@ app.post('/api/history', async (req, res) => {
 });
 
 app.delete('/api/history', async (req, res) => {
+  const auth = await resolveClerkHistoryUser(req);
+  if (auth === 'unauthorized') {
+    return res.status(401).json({ error: '未登录或会话无效。请重新登录。' });
+  }
   const id = (req.query?.id ?? req.body?.id) as string | undefined;
   if (!id) return res.status(400).json({ error: '缺少 id' });
   const ok = await withHistoryDb(async (sql) => {
-    await sql`DELETE FROM translations WHERE id = ${id}`;
+    if (auth === 'legacy') {
+      await sql`DELETE FROM translations WHERE id = ${id}`;
+    } else if (isClerkHistoryAdmin(auth.userId)) {
+      await sql`DELETE FROM translations WHERE id = ${id}`;
+    } else {
+      await sql`DELETE FROM translations WHERE id = ${id} AND username = ${auth.userId}`;
+    }
     return true;
   });
   if (ok === null) return res.status(503).json({ error: '历史同步未配置。' });
@@ -624,5 +832,9 @@ app.listen(PORT, () => {
   console.log(`Translator API running at http://localhost:${PORT}`);
   if (!hasKey) {
     console.warn('⚠️  DEEPSEEK_API_KEY 未配置，翻译请求将失败。请创建 bilingual-editorial/.env.local 并填写密钥。');
+  }
+  const clerkSecret = (process.env.CLERK_SECRET_KEY || '').trim();
+  if (clerkSecret) {
+    console.log('✓ CLERK_SECRET_KEY 已配置：/api/history 将校验会话并按用户隔离数据。');
   }
 });
