@@ -849,22 +849,13 @@ export default function App() {
       throw new Error("文档内容为空");
     }
 
-    const MAX_CHARS = 30000;
-    const limitedParagraphs: string[] = [];
-    let total = 0;
-    for (const p of paragraphs) {
-      if (total + p.length > MAX_CHARS) break;
-      limitedParagraphs.push(p);
-      total += p.length;
-    }
-
     const apiSourceLang = detected;
     setContent([]);
 
     let result: TranslateResult;
     try {
       result = await translateAndAnalyzeStream(
-        limitedParagraphs,
+        paragraphs,
         (p) => setProgress(p),
         apiSourceLang,
         (partial) => {
@@ -885,7 +876,7 @@ export default function App() {
         setProgress({ percent: fallbackPercent, step: "翻译中..." });
       }, 1500);
       try {
-        result = await translateAndAnalyze(limitedParagraphs, apiSourceLang);
+        result = await translateAndAnalyze(paragraphs, apiSourceLang);
       } finally {
         clearInterval(fallbackTimer);
       }
