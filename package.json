@@ -1,0 +1,9 @@
+{
+  "name": "translator-project",
+  "private": true,
+  "scripts": {
+    "dev": "cd bilingual-editorial && npm run dev",
+    "server": "cd bilingual-editorial && npm run server",
+    "start": "cd bilingual-editorial && npm run start"
+  }
+}

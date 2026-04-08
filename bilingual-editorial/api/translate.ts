@@ -1,0 +1,351 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import JSON5 from 'json5';
+
+const CHUNK_SIZE = 10000;
+
+function splitIntoChunks(paragraphs: string[], maxChars: number): string[][] {
+  const normalized: string[] = [];
+  for (const p of paragraphs) {
+    if (p.length <= maxChars) {
+      normalized.push(p);
+    } else {
+      const sentences = p.match(/[^.!?]+[.!?]+\s*/g) ?? [p];
+      let piece = '';
+      for (const s of sentences) {
+        if (piece.length + s.length > maxChars && piece) {
+          normalized.push(piece.trim());
+          piece = s;
+        } else {
+          piece += s;
+        }
+      }
+      if (piece.trim()) normalized.push(piece.trim());
+    }
+  }
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let size = 0;
+  for (const p of normalized) {
+    if (size + p.length > maxChars && current.length > 0) {
+      chunks.push(current);
+      current = [p];
+      size = p.length;
+    } else {
+      current.push(p);
+      size += p.length;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function extractTitleAuthorFromTranslation(
+  translation: { en: string; zh: string }[]
+): { title?: { en: string; zh: string }; author?: { en: string; zh: string } } {
+  const result: { title?: { en: string; zh: string }; author?: { en: string; zh: string } } = {};
+  const firstFew = translation.slice(0, 4).map(p => ({ en: (p.en || '').trim(), zh: (p.zh || '').trim() }));
+
+  const first = firstFew[0];
+  if (first && (first.en || first.zh)) {
+    const enLines = (first.en || '').split(/\n/).map(s => s.trim()).filter(Boolean);
+    const zhLines = (first.zh || '').split(/\n/).map(s => s.trim()).filter(Boolean);
+    const firstLineEn = enLines[0] || '';
+    const firstLineZh = zhLines[0] || '';
+    const isAuthorLine = /^作者[：:]|^Author[：:\s]|^[Bb]y\s+\w+/.test(firstLineEn) || /^作者[：:]/.test(firstLineZh);
+    const maxLen = 60;
+    const enShort = firstLineEn.length <= maxLen && !/\.\s*$|!\s*$|\?\s*$/.test(firstLineEn);
+    const zhShort = firstLineZh.length <= maxLen && !/[。！？]\s*$/.test(firstLineZh);
+    if (!isAuthorLine && (enShort || zhShort)) {
+      result.title = { en: firstLineEn, zh: firstLineZh };
+    }
+  }
+
+  const authorPatterns = [
+    { zh: /作者[：:]\s*([^\n。，]+)/, en: /Author[：:\s]+([^\n.,]+)/i },
+    { zh: /作者[：:]?\s*([^\n。，]+)/, en: /[Bb]y\s+([^\n.,]+(?:\s+[A-Z][a-z]+)?)/ },
+  ];
+  for (const pair of firstFew) {
+    const mZh = pair.zh.match(authorPatterns[0].zh) || pair.zh.match(authorPatterns[1].zh);
+    const mEn = pair.en.match(authorPatterns[0].en) || pair.en.match(authorPatterns[1].en);
+    const nameZh = mZh?.[1]?.trim();
+    const nameEn = mEn?.[1]?.trim();
+    if (nameZh || nameEn) {
+      result.author = { zh: nameZh || '', en: nameEn || '' };
+      break;
+    }
+  }
+  return result;
+}
+
+type BilingualStr = { en: string; zh: string };
+type CharacterInfo = { name: BilingualStr; description: BilingualStr };
+type BilingualAnalysis = { summary: BilingualStr; narrativeDetail: BilingualStr; themes: BilingualStr[]; pros: BilingualStr[]; cons: BilingualStr[]; plotSynopsis?: BilingualStr; characters?: CharacterInfo[] };
+
+function normalizeAnalysis(raw: unknown): BilingualAnalysis | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+
+  const toBilingual = (v: unknown): BilingualStr => {
+    if (v && typeof v === 'object') {
+      const b = v as Record<string, unknown>;
+      if ('en' in b || 'zh' in b) {
+        return { en: typeof b.en === 'string' ? b.en.trim() : '', zh: typeof b.zh === 'string' ? b.zh.trim() : '' };
+      }
+    }
+    const s = typeof v === 'string' ? v.trim() : '';
+    return { en: '', zh: s };
+  };
+
+  const toArr = (v: unknown): BilingualStr[] => {
+    if (!Array.isArray(v)) return [];
+    return v.map(item => toBilingual(item));
+  };
+
+  const summary = toBilingual(o.summary ?? o.Summary);
+  const narrativeDetail = toBilingual(o.narrativeDetail ?? o.narrative_detail);
+  const themes = toArr(o.themes ?? o.Themes);
+  const pros = toArr(o.pros ?? o.Pros);
+  const cons = toArr(o.cons ?? o.Cons);
+  const plotSynopsis = toBilingual(o.plotSynopsis ?? o.plot_synopsis ?? o.PlotSynopsis);
+  const characters: CharacterInfo[] = (() => {
+    const raw = o.characters ?? o.Characters;
+    if (!Array.isArray(raw)) return [];
+    return raw.map((c: unknown) => {
+      if (!c || typeof c !== 'object') return { name: { en: '', zh: '' }, description: { en: '', zh: '' } };
+      const ch = c as Record<string, unknown>;
+      return { name: toBilingual(ch.name ?? ch.Name), description: toBilingual(ch.description ?? ch.Description) };
+    }).filter((c: CharacterInfo) => c.name.en || c.name.zh);
+  })();
+
+  const hasContent = summary.en || summary.zh || narrativeDetail.en || narrativeDetail.zh ||
+    themes.length > 0 || pros.length > 0 || cons.length > 0 ||
+    plotSynopsis.en || plotSynopsis.zh || characters.length > 0;
+  if (!hasContent) return null;
+
+  const ph: BilingualStr = { en: '—', zh: '—' };
+  return {
+    summary: (summary.en || summary.zh) ? summary : ph,
+    narrativeDetail: (narrativeDetail.en || narrativeDetail.zh) ? narrativeDetail : ph,
+    themes: themes.length ? themes : [ph],
+    pros: pros.length ? pros : [ph],
+    cons: cons.length ? cons : [ph],
+    plotSynopsis: (plotSynopsis.en || plotSynopsis.zh) ? plotSynopsis : undefined,
+    characters: characters.length > 0 ? characters : undefined,
+  };
+}
+
+/** 将模型可能返回的各种 translation 格式统一为数组 */
+function normalizeTranslationToArray(raw: unknown, expectedLen: number): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    const o = raw as Record<string, unknown>;
+    const arr: unknown[] = [];
+    for (let i = 0; i < expectedLen; i++) {
+      const v = o[String(i)] ?? o[i];
+      if (v !== undefined && v !== null) arr.push(v);
+    }
+    if (arr.length > 0) return arr;
+    const values = Object.values(o);
+    if (values.length > 0) return values;
+  }
+  if (typeof raw === 'string') return raw.split(/\n\s*\n/).filter(Boolean);
+  return [];
+}
+
+/** 移除模型可能回显的段落标记（如 # Paragraph 8、# 段落 9） */
+function stripParagraphMarkers(s: string): string {
+  return s
+    .replace(/(?:^|\n)\s*#\s*(?:Paragraph|段落)\s*\d+\s*(?:\n|$)/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function mergeTranslation(
+  sourceParagraphs: string[],
+  raw: unknown[],
+  sourceLang: 'en' | 'zh'
+): { en: string; zh: string }[] {
+  return sourceParagraphs.map((src, i) => {
+    const v = raw[i];
+    let translated = '';
+    if (typeof v === 'string') {
+      translated = stripParagraphMarkers(v);
+    } else if (v && typeof v === 'object') {
+      const key = sourceLang === 'zh' ? 'en' : 'zh';
+      translated = stripParagraphMarkers(String((v as Record<string, unknown>)[key] ?? ''));
+    }
+    return sourceLang === 'zh'
+      ? { en: translated, zh: src }
+      : { en: src, zh: translated };
+  });
+}
+
+const LANG_NAMES: Record<string, string> = { en: '英文', fr: '法文', ja: '日文', 'zh-TW': '繁体中文', zh: '中文' };
+
+function buildTranslationToZhPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为简体中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["中文1", "中文2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildZhToEnTranslationOnlyPrompt(paragraphs: string[]): string {
+  return `将以下中文段落翻译为英文，仅输出 JSON，translation 为英文数组，顺序对应，不要回显中文：
+{ "translation": ["English 1", "..."] }
+
+段落：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+const sanitizeJson = (s: string) => s.replace(/,(\s*[\]}])/g, '$1');
+
+function parseDeepSeekJson(content: string): Record<string, unknown> {
+  try { return JSON.parse(content || '{}'); } catch {}
+  try { return JSON.parse(sanitizeJson(content)); } catch {}
+  try { return JSON5.parse(content); } catch {}
+  const m = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/);
+  const extracted = m ? (m[1] ?? m[0]) : '{}';
+  try { return JSON5.parse(extracted); } catch { return {}; }
+}
+
+async function callDeepSeek(prompt: string, apiKey: string): Promise<Record<string, unknown>> {
+  const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [
+        { role: 'system', content: 'You are a professional bilingual literary editor. Always respond with valid JSON only.' },
+        { role: 'user', content: prompt },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 8192,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    let userMsg = 'DeepSeek API 调用失败';
+    try {
+      const errJson = JSON.parse(text);
+      const apiErr = errJson?.error?.message || errJson?.message || errJson?.error;
+      if (apiErr) userMsg = typeof apiErr === 'string' ? apiErr : String(apiErr);
+      if (response.status === 401) userMsg = 'API Key 无效或已过期，请在 Vercel 中检查 DEEPSEEK_API_KEY';
+      else if (response.status === 429) userMsg = '请求过于频繁，请稍后再试';
+    } catch {}
+    throw new Error(userMsg);
+  }
+
+  const data = await response.json();
+  return parseDeepSeekJson(data.choices?.[0]?.message?.content ?? '');
+}
+
+function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): string {
+  const langLabel = LANG_NAMES[sourceLang] || '外文';
+  return `你是一个专业的中英双语文学编辑。请对以下${langLabel}文章进行结构化写作分析，并提取标题和作者。
+
+【标题提取规则】
+- 标题通常是第一段或第一行，多为短语
+- 若首段是短句（≤60 字、无句号结尾），即视为标题
+
+【作者提取规则】
+- 常见格式：英文 "Author: XXX"、"By XXX"；中文 "作者：XXX"
+- 只提取姓名，去掉前缀
+
+【字数上限】summary≤60字，narrativeDetail≤200字，plotSynopsis约500字（详细的剧情梗概），其余每项≤40字
+【人物提取】characters 数组列出文中主要人物，每个人物包含 name 和 description（简要介绍其身份、性格、在故事中的角色）
+
+输出严格 JSON：
+{
+  "title": { "en": "...", "zh": "..." },
+  "author": { "en": "...", "zh": "..." },
+  "analysis": {
+    "summary": { "en": "...", "zh": "..." },
+    "narrativeDetail": { "en": "...", "zh": "..." },
+    "plotSynopsis": { "en": "...(~500 words plot synopsis)...", "zh": "...(~500字剧情梗概)..." },
+    "characters": [{ "name": { "en": "...", "zh": "..." }, "description": { "en": "...", "zh": "..." } }],
+    "themes": [{ "en": "...", "zh": "..." }],
+    "pros": [{ "en": "...", "zh": "..." }],
+    "cons": [{ "en": "...", "zh": "..." }]
+  }
+}
+
+文章内容：
+${paragraphs.slice(0, 15).map((p, i) => `# ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
+  const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
+  if (!DEEPSEEK_API_KEY || placeholders.some(p => DEEPSEEK_API_KEY.includes(p))) {
+    return res.status(503).json({
+      error: '请先在 Vercel 项目设置中配置 DEEPSEEK_API_KEY 环境变量',
+    });
+  }
+
+  try {
+    const { paragraphs, sourceLang = 'en', sourceLangFull } = (req.body || {}) as { paragraphs?: string[]; sourceLang?: string; sourceLangFull?: string };
+    if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+      return res.status(400).json({ error: 'paragraphs is required' });
+    }
+
+    const lang = sourceLangFull || sourceLang || 'en';
+    const transPrompt = lang === 'zh' ? buildZhToEnTranslationOnlyPrompt : (chunk: string[]) => buildTranslationToZhPrompt(chunk, lang);
+    const mergeLang: 'en' | 'zh' = lang === 'zh' ? 'zh' : 'en';
+    const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
+
+    // 所有翻译块 + analysis 完全并行
+    const [analysisJson, ...translationResults] = await Promise.all([
+      callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, lang), DEEPSEEK_API_KEY),
+      ...chunks.map((chunk) => callDeepSeek(transPrompt(chunk), DEEPSEEK_API_KEY)),
+    ]);
+
+    const allTranslations: { en: string; zh: string }[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkRaw = normalizeTranslationToArray(translationResults[i]?.translation, chunks[i].length);
+      if (chunkRaw.length > 0) {
+        allTranslations.push(...mergeTranslation(chunks[i], chunkRaw, mergeLang));
+      }
+    }
+
+    if (allTranslations.length === 0) {
+      return res.status(500).json({ error: '模型返回格式异常，请重试' });
+    }
+
+    let title = (analysisJson?.title as { en: string; zh: string }) ?? { en: '', zh: '' };
+    let author = (analysisJson?.author as { en: string; zh: string }) ?? { en: '', zh: '' };
+
+    const fallback = extractTitleAuthorFromTranslation(allTranslations);
+    const isEmpty = (t: { en?: string; zh?: string }) => {
+      const v = (t?.en?.trim() || t?.zh?.trim() || '').replace(/[—\-]/g, '');
+      return !v;
+    };
+    if (isEmpty(title) && (fallback.title?.en || fallback.title?.zh)) {
+      title = fallback.title!;
+    }
+    if (isEmpty(author) && (fallback.author?.en || fallback.author?.zh)) {
+      author = fallback.author!;
+    }
+
+    const analysis = normalizeAnalysis(analysisJson?.analysis);
+    return res.status(200).json({ title, author, translation: allTranslations, analysis });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    return res.status(500).json({ error: msg });
+  }
+}
