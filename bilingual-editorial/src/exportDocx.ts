@@ -31,6 +31,8 @@ interface Annotation {
 
 type Annotations = Annotation[];
 
+type ExportTargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse";
+
 interface ExportOptions {
   title: { en: string; zh: string };
   author: { en: string; zh: string };
@@ -38,6 +40,11 @@ interface ExportOptions {
   annotations: Annotations;
   analysis: unknown;
   originalDocx: ArrayBuffer | null;
+  targetLang?: ExportTargetLang;
+}
+
+function originalColumnForExport(pair: ParagraphPair, targetLang: ExportTargetLang): string {
+  return targetLang === "en" ? pair.zh : pair.en;
 }
 
 // ─── Original .docx injection path ───
@@ -332,7 +339,7 @@ async function exportWithOriginal(
 
 // ─── Fallback: create new document (for text input / PDF) ───
 
-function makeFallbackDoc(content: ParagraphPair[], annotations: Annotations): Document {
+function makeFallbackDoc(content: ParagraphPair[], annotations: Annotations, targetLang: ExportTargetLang = "zh"): Document {
   const FONT = "Times New Roman";
   const FONT_SIZE = 24;
   const LINE_SPACING = 276;
@@ -351,7 +358,7 @@ function makeFallbackDoc(content: ParagraphPair[], annotations: Annotations): Do
   const children: Paragraph[] = [];
 
   content.forEach((pair, pi) => {
-    const text = pair.en;
+    const text = originalColumnForExport(pair, targetLang);
     const anns = paraAnns.get(pi);
 
     if (anns && anns.length > 0) {
@@ -414,7 +421,7 @@ function makeFallbackDoc(content: ParagraphPair[], annotations: Annotations): Do
 // ─── Main export function ───
 
 export async function exportToDocx(options: ExportOptions): Promise<void> {
-  const { title, content, annotations, originalDocx } = options;
+  const { title, content, annotations, originalDocx, targetLang = "zh" } = options;
   const filename = `${(title.en || title.zh || "document").replace(/[^\w\u4e00-\u9fff]/g, "_")}.docx`;
 
   if (originalDocx) {
@@ -422,7 +429,7 @@ export async function exportToDocx(options: ExportOptions): Promise<void> {
     await exportWithOriginal(originalDocx, annotations, filename);
   } else {
     // Fallback: build new document
-    const doc = makeFallbackDoc(content, annotations);
+    const doc = makeFallbackDoc(content, annotations, targetLang);
     const blob = await Packer.toBlob(doc);
     saveAs(blob, filename);
   }
