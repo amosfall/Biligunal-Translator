@@ -68,16 +68,12 @@ export async function fetchAkiMemePairDeepseek(
   );
 
   const eligibleRaw = json.eligible;
+  /** 仅显式拒绝；模型常漏写 eligible 字段，若仍要求 eligible===true 会把合法梗全部丢弃 */
   const eligibleFalse =
     eligibleRaw === false ||
     eligibleRaw === "false" ||
     String(eligibleRaw ?? "").toLowerCase() === "false";
   if (eligibleFalse) return null;
-
-  const eligibleTrue =
-    eligibleRaw === true ||
-    eligibleRaw === "true" ||
-    String(eligibleRaw ?? "").toLowerCase() === "true";
 
   const zh = String(json.zh ?? "")
     .trim()
@@ -87,7 +83,6 @@ export async function fetchAkiMemePairDeepseek(
     .slice(0, 400);
 
   if (!zh) return null;
-  if (!eligibleTrue) return null;
 
   return { zh, en };
 }

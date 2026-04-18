@@ -1,13 +1,30 @@
 /**
  * AKI 动态梗：先判定是否「专名向」再决定是否生成毒舌梗（不接外网搜索）。
+ * 密文仍对用户原文 encodeAki；此处扩写仅给模型判 eligible / 写梗用。
  */
 
+/** 给模型的提示用扩写（密文仍编用户原文）；减少「简称/地名」被误判为非专名 */
+const MEME_PROMPT_EXPAND: Record<string, string> = {
+  北大: "北京大学（常用简称「北大」）",
+  清华: "清华大学（常用简称「清华」）",
+  港大: "香港大学（常用简称「港大」）",
+  复旦: "复旦大学（常用简称「复旦」）",
+  北京: "北京（中国城市／首都，地名专名）",
+  北京大学: "北京大学（中国大陆高等院校）",
+};
+
+export function expandChineseUniNicknameForMemePrompt(raw: string): string {
+  const t = raw.replace(/\r\n/g, "\n").trim().replace(/\s+/g, " ");
+  return MEME_PROMPT_EXPAND[t] ?? t;
+}
+
 export function buildAkiMemePrompt(userPhrase: string): string {
-  return `你是熟悉中文互联网段子与亚文化的文案作者。用户会输入一段话或短语（常为一段原文里的一小段）。
+  const phraseForModel = expandChineseUniNicknameForMemePrompt(userPhrase);
+  return `你是熟悉中文互联网段子与亚文化的文案作者。用户会输入一段话或短语（常为一段原文里的一小段）。下面「用户短语」可能已把常见**高校简称**扩成带校名的说明，请据此将 eligible 判为 true。
 
 第一步：判断 **eligible**（布尔值）——仅当输入**主要是在指代或讨论**下列类型时，eligible 才为 true：
-- 高等院校 / 大学 / 学院等；
-- 城市、地区、国家地名（含常见别称）；
+- 高等院校 / 大学 / 学院等（含**单独出现的常用中文简称**，如北大、清华、复旦、港大等，均视为高校专名）；
+- 城市、地区、国家地名（含常见别称；**单独「北京」指北京市／首都地名专名**，eligible 须为 true，勿当成普通形容词）；
 - 歌手、乐队、音乐人、艺人等文化专名（可带简短修饰，如「东京大学」「万青」）。
 
 eligible 必须为 **false** 的情况举例：日常寒暄、问候、随口闲聊、抽象概念、普通叙述句、无明确上述专名指向的句子（如「你好呀」「今天天气不错」「帮我翻译」等）。
@@ -24,5 +41,5 @@ eligible 必须为 **false** 的情况举例：日常寒暄、问候、随口闲
 - zh：eligible 为 true 时：约 50～80 个汉字的简体中文梗（可略长以容纳开场+排比）；否则 "" 。
 - en：eligible 为 true 时：一句或两句英文，够 snarky；否则 "" 。
 
-用户短语：${JSON.stringify(userPhrase)}`;
+用户短语：${JSON.stringify(phraseForModel)}`;
 }
