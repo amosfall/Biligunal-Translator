@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
+import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode';
 
 const CHUNK_SIZE = 10000;
 
@@ -160,10 +161,11 @@ function stripParagraphMarkers(s: string): string {
     .trim();
 }
 
+/** to_cjk：pair.en 为原文，pair.zh 为中文译文；to_en：pair.zh 为原文，pair.en 为英文译文 */
 function mergeTranslation(
   sourceParagraphs: string[],
   raw: unknown[],
-  sourceLang: 'en' | 'zh'
+  layout: 'to_cjk' | 'to_en'
 ): { en: string; zh: string }[] {
   return sourceParagraphs.map((src, i) => {
     const v = raw[i];
@@ -171,22 +173,211 @@ function mergeTranslation(
     if (typeof v === 'string') {
       translated = stripParagraphMarkers(v);
     } else if (v && typeof v === 'object') {
-      const key = sourceLang === 'zh' ? 'en' : 'zh';
+      const key = layout === 'to_en' ? 'en' : 'zh';
       translated = stripParagraphMarkers(String((v as Record<string, unknown>)[key] ?? ''));
     }
-    return sourceLang === 'zh'
-      ? { en: translated, zh: src }
-      : { en: src, zh: translated };
+    return layout === 'to_cjk'
+      ? { en: src, zh: translated }
+      : { en: translated, zh: src };
   });
 }
 
-const LANG_NAMES: Record<string, string> = { en: '英文', fr: '法文', ja: '日文', 'zh-TW': '繁体中文', zh: '中文' };
+const LANG_NAMES: Record<string, string> = {
+  en: '英文',
+  fr: '法文',
+  ja: '日文',
+  de: '德文',
+  ar: '阿拉伯文',
+  'zh-TW': '繁体中文',
+  zh: '中文',
+};
+
+
+type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse';
+
+const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse']);
+
+function normalizeTargetLang(raw: string | undefined): TargetLang {
+  const r = typeof raw === 'string' ? raw.trim() : '';
+  if (VALID_TARGET_LANGS.has(r)) return r as TargetLang;
+  return 'zh';
+}
+
+function validateSourceTarget(sourceLang: string, targetLang: string): string | null {
+  if (!VALID_TARGET_LANGS.has(targetLang)) {
+    return '无效的译文语言';
+  }
+  if (sourceLang === targetLang) {
+    return '原文语言与译文语言不能相同';
+  }
+  return null;
+}
+
+function resolveTranslationFlow(
+  sourceLang: string,
+  targetLang: string
+): { error: string } | { analysisLang: string; layout: 'to_cjk' | 'to_en'; transPrompt: (chunk: string[]) => string } {
+  const err = validateSourceTarget(sourceLang, targetLang);
+  if (err) return { error: err };
+
+  if (sourceLang === 'zh' && targetLang === 'en') {
+    return {
+      analysisLang: 'zh',
+      layout: 'to_en',
+      transPrompt: buildZhToEnTranslationOnlyPrompt,
+    };
+  }
+
+  if (targetLang === 'zh') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToZhPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'zh-TW') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToZhTwPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'en') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_en',
+      transPrompt: (chunk: string[]) => buildTranslationToEnPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'ja') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToJaPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'fr') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToFrPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'de') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToDePrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'ar') {
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToArPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'morse') {
+    if (sourceLang === 'zh') {
+      return {
+        analysisLang: 'zh',
+        layout: 'to_cjk',
+        transPrompt: buildZhToEnTranslationOnlyPrompt,
+      };
+    }
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToEnPrompt(chunk, sourceLang),
+    };
+  }
+
+  return { error: '无法解析翻译方向' };
+}
 
 function buildTranslationToZhPrompt(paragraphs: string[], fromLang = 'en'): string {
   const langName = LANG_NAMES[fromLang] || '外文';
   return `将以下${langName}段落翻译为简体中文，仅输出 JSON，格式如下（不要多余文字）。translation 为中文数组，顺序与输入一一对应，不要回显原文：
 {
   "translation": ["中文1", "中文2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+
+
+function buildTranslationToZhTwPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为繁体中文（台湾正体），仅输出 JSON，格式如下（不要多余文字）。translation 为繁体中文数组，顺序与输入一一对应，不要回显原文。
+
+【繁体要求】必须使用台湾常用繁体字形（如「臺灣、資訊、匯整」），严禁使用大陆简体字（如「台湾、信息、汇总」）；译文中的汉字不得采用简体中文写法。
+
+{
+  "translation": ["繁體1", "繁體2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildTranslationToEnPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为英文，仅输出 JSON，格式如下（不要多余文字）。translation 为英文数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["English 1", "English 2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildTranslationToJaPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为日文（自然、地道的现代日语），仅输出 JSON，格式如下（不要多余文字）。translation 为日文数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["日文1", "日文2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildTranslationToFrPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为法语，仅输出 JSON，格式如下（不要多余文字）。translation 为法语数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["Français 1", "Français 2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildTranslationToDePrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为德语，仅输出 JSON，格式如下（不要多余文字）。translation 为德语数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["Deutsch 1", "Deutsch 2", "..."]
+}
+
+待翻译段落（保持顺序）：
+${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+function buildTranslationToArPrompt(paragraphs: string[], fromLang = 'en'): string {
+  const langName = LANG_NAMES[fromLang] || '外文';
+  return `将以下${langName}段落翻译为现代标准阿拉伯语，使用阿拉伯字母书写。仅输出 JSON，格式如下（不要多余文字）。translation 为阿拉伯语数组，顺序与输入一一对应，不要回显原文：
+{
+  "translation": ["العربية 1", "العربية 2", "..."]
 }
 
 待翻译段落（保持顺序）：
@@ -247,9 +438,12 @@ async function callDeepSeek(prompt: string, apiKey: string): Promise<Record<stri
   return parseDeepSeekJson(data.choices?.[0]?.message?.content ?? '');
 }
 
-function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): string {
-  const langLabel = LANG_NAMES[sourceLang] || '外文';
-  return `你是一个专业的中英双语文学编辑。请对以下${langLabel}文章进行结构化写作分析，并提取标题和作者。
+function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string, targetLang: string): string {
+  const srcLabel = LANG_NAMES[sourceLang] || '外文';
+  // morse 的目标栏先用英文产出，后续由服务端做摩斯编码
+  const effectiveTarget = targetLang === 'morse' ? 'en' : targetLang;
+  const tgtLabel = LANG_NAMES[effectiveTarget] || '目标语言';
+  return `你是一个专业的中英双语文学编辑。请对以下${srcLabel}文章进行结构化写作分析，并提取标题和作者。
 
 【标题提取规则】
 - 标题通常是第一段或第一行，多为短语
@@ -259,13 +453,20 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): stri
 - 常见格式：英文 "Author: XXX"、"By XXX"；中文 "作者：XXX"
 - 只提取姓名，去掉前缀
 
+【标题/作者多语种输出】
+- title.src：用原文（${srcLabel}）写出的标题
+- title.tgt：用译文（${tgtLabel}）写出的标题
+- author.src / author.tgt 同理
+- 若原文找不到作者，两侧都填 "Unknown"
+
 【字数上限】summary≤60字，narrativeDetail≤200字，plotSynopsis约500字（详细的剧情梗概），其余每项≤40字
 【人物提取】characters 数组列出文中主要人物，每个人物包含 name 和 description（简要介绍其身份、性格、在故事中的角色）
+【analysis 字段】summary / narrativeDetail / plotSynopsis / characters / themes / pros / cons 始终按 {en, zh}（英文 + 简体中文）双语输出，与目标语无关。
 
 输出严格 JSON：
 {
-  "title": { "en": "...", "zh": "..." },
-  "author": { "en": "...", "zh": "..." },
+  "title": { "src": "...(${srcLabel})", "tgt": "...(${tgtLabel})" },
+  "author": { "src": "...(${srcLabel})", "tgt": "...(${tgtLabel})" },
   "analysis": {
     "summary": { "en": "...", "zh": "..." },
     "narrativeDetail": { "en": "...", "zh": "..." },
@@ -279,6 +480,37 @@ function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string): stri
 
 文章内容：
 ${paragraphs.slice(0, 15).map((p, i) => `# ${i + 1}\n${p}`).join('\n\n')}`.trim();
+}
+
+/**
+ * 将模型返回的 title / author 字段映射到「原文栏 / 译文栏」slot。
+ * 新版 {src, tgt}：src 是原文语言，tgt 是目标语言；旧版 {en, zh}：向后兼容。
+ * - layout=to_cjk：en = 原文栏，zh = 译文栏
+ * - layout=to_en： en = 译文栏（英文），zh = 原文栏
+ */
+function mapTitleAuthorToSlots(
+  raw: unknown,
+  layout: 'to_cjk' | 'to_en'
+): { en: string; zh: string } {
+  if (!raw || typeof raw !== 'object') return { en: '', zh: '' };
+  const o = raw as Record<string, unknown>;
+  const asStr = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+  const src = asStr(o.src ?? o.source);
+  const tgt = asStr(o.tgt ?? o.target);
+  if (src || tgt) {
+    return layout === 'to_cjk' ? { en: src, zh: tgt } : { en: tgt, zh: src };
+  }
+  return { en: asStr(o.en), zh: asStr(o.zh) };
+}
+
+/** 对 title / author 的「译文栏」施加摩斯编码（仅当 targetLang === 'morse'） */
+function applyMorseToTitleAuthorSlots(
+  t: { en: string; zh: string },
+  layout: 'to_cjk' | 'to_en'
+): { en: string; zh: string } {
+  const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
+  const morse = encodeInternationalMorse(t[tgtKey]);
+  return { ...t, [tgtKey]: morse || '—' };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -299,19 +531,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { paragraphs, sourceLang = 'en', sourceLangFull } = (req.body || {}) as { paragraphs?: string[]; sourceLang?: string; sourceLangFull?: string };
+    const { paragraphs, sourceLang = 'en', sourceLangFull, targetLang: rawTarget } = (req.body || {}) as { paragraphs?: string[]; sourceLang?: string; sourceLangFull?: string; targetLang?: string };
     if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
       return res.status(400).json({ error: 'paragraphs is required' });
     }
 
     const lang = sourceLangFull || sourceLang || 'en';
-    const transPrompt = lang === 'zh' ? buildZhToEnTranslationOnlyPrompt : (chunk: string[]) => buildTranslationToZhPrompt(chunk, lang);
-    const mergeLang: 'en' | 'zh' = lang === 'zh' ? 'zh' : 'en';
+    const targetLang = normalizeTargetLang(rawTarget);
+
+    const flow = resolveTranslationFlow(lang, targetLang);
+    if ('error' in flow) {
+      return res.status(400).json({ error: flow.error });
+    }
+
+    const { analysisLang, layout, transPrompt } = flow;
     const chunks = splitIntoChunks(paragraphs, CHUNK_SIZE);
 
     // 所有翻译块 + analysis 完全并行
     const [analysisJson, ...translationResults] = await Promise.all([
-      callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, lang), DEEPSEEK_API_KEY),
+      callDeepSeek(buildAnalysisOnlyPrompt(paragraphs, analysisLang, targetLang), DEEPSEEK_API_KEY),
       ...chunks.map((chunk) => callDeepSeek(transPrompt(chunk), DEEPSEEK_API_KEY)),
     ]);
 
@@ -319,7 +557,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (let i = 0; i < chunks.length; i++) {
       const chunkRaw = normalizeTranslationToArray(translationResults[i]?.translation, chunks[i].length);
       if (chunkRaw.length > 0) {
-        allTranslations.push(...mergeTranslation(chunks[i], chunkRaw, mergeLang));
+        allTranslations.push(...mergeTranslation(chunks[i], chunkRaw, layout));
       }
     }
 
@@ -327,8 +565,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: '模型返回格式异常，请重试' });
     }
 
-    let title = (analysisJson?.title as { en: string; zh: string }) ?? { en: '', zh: '' };
-    let author = (analysisJson?.author as { en: string; zh: string }) ?? { en: '', zh: '' };
+    let title = mapTitleAuthorToSlots(analysisJson?.title, layout);
+    let author = mapTitleAuthorToSlots(analysisJson?.author, layout);
 
     const fallback = extractTitleAuthorFromTranslation(allTranslations);
     const isEmpty = (t: { en?: string; zh?: string }) => {
@@ -342,8 +580,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       author = fallback.author!;
     }
 
+    if (targetLang === 'morse') {
+      title = applyMorseToTitleAuthorSlots(title, layout);
+      author = applyMorseToTitleAuthorSlots(author, layout);
+    }
+
     const analysis = normalizeAnalysis(analysisJson?.analysis);
-    return res.status(200).json({ title, author, translation: allTranslations, analysis });
+    const translationOut =
+      targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations) : allTranslations;
+    return res.status(200).json({ title, author, translation: translationOut, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
     return res.status(500).json({ error: msg });

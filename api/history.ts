@@ -21,6 +21,7 @@ const MIGRATE_SQLS = [
   `ALTER TABLE translations ADD COLUMN IF NOT EXISTS annotations JSONB`,
   `ALTER TABLE translations ADD COLUMN IF NOT EXISTS username TEXT`,
   `ALTER TABLE translations ADD COLUMN IF NOT EXISTS source_lang TEXT`,
+  `ALTER TABLE translations ADD COLUMN IF NOT EXISTS target_lang TEXT`,
 ];
 
 async function withHistoryDb<T>(fn: (sql: Awaited<ReturnType<typeof neon>>) => Promise<T>): Promise<T | null> {
@@ -88,12 +89,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const result = await withHistoryDb(async (sql) => {
       const rows =
         auth === 'legacy'
-          ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+          ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang, target_lang
               FROM translations ORDER BY created_at_ms DESC LIMIT 100`
           : admin
-            ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+            ? await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang, target_lang
                 FROM translations ORDER BY created_at_ms DESC LIMIT 500`
-            : await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang
+            : await sql`SELECT id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang, target_lang
                 FROM translations WHERE username = ${auth.userId} ORDER BY created_at_ms DESC LIMIT 100`;
       return rows as Record<string, unknown>[];
     });
@@ -110,6 +111,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       annotations: (r.annotations as Record<string, unknown>) ?? undefined,
       username: r.username ? String(r.username) : undefined,
       sourceLang: r.source_lang ? String(r.source_lang) : undefined,
+      targetLang: r.target_lang ? String(r.target_lang) : undefined,
     }));
     const labelMap = await resolveOwnerDisplayNames(
       items.map((i) => i.username),
@@ -139,6 +141,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       annotations?: Record<string, unknown> | null;
       username?: string;
       sourceLang?: string;
+      targetLang?: string;
     };
     const id = (body?.id || crypto.randomUUID()) as string;
     const createdAt = typeof body?.createdAt === 'number' ? body.createdAt : Date.now();
@@ -149,6 +152,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const annotations = body?.annotations ?? null;
     const dbUsername = auth !== 'legacy' ? auth.userId : body?.username || null;
     const dbSourceLang = body?.sourceLang || null;
+    const dbTargetLang = body?.targetLang || null;
     if (content.length === 0) return res.status(400).json({ error: 'content 不能为空' });
 
     const ok = await withHistoryDb(async (sql) => {
@@ -156,12 +160,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const analysisStr = analysis ? JSON.stringify(analysis) : null;
       const annotationsStr = annotations ? JSON.stringify(annotations) : null;
       await sql.query(
-        `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `INSERT INTO translations (id, created_at_ms, title_zh, title_en, author_zh, author_en, content, analysis, annotations, username, source_lang, target_lang)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (id) DO UPDATE SET created_at_ms = EXCLUDED.created_at_ms, title_zh = EXCLUDED.title_zh, title_en = EXCLUDED.title_en,
            author_zh = EXCLUDED.author_zh, author_en = EXCLUDED.author_en, content = EXCLUDED.content, analysis = EXCLUDED.analysis,
-           annotations = EXCLUDED.annotations, username = EXCLUDED.username, source_lang = EXCLUDED.source_lang`,
-        [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr, annotationsStr, dbUsername, dbSourceLang]
+           annotations = EXCLUDED.annotations, username = EXCLUDED.username, source_lang = EXCLUDED.source_lang, target_lang = EXCLUDED.target_lang`,
+        [id, createdAt, title.zh ?? '', title.en ?? '', author.zh ?? '', author.en ?? '', contentStr, analysisStr, annotationsStr, dbUsername, dbSourceLang, dbTargetLang]
       );
       return true;
     });

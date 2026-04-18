@@ -27,14 +27,70 @@ async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<string> {
   return pages.join("\n\n");
 }
 
-type SourceLang = "en" | "fr" | "ja" | "zh-TW";
+type SourceLang = "en" | "fr" | "ja" | "de" | "ar" | "zh-TW" | "zh";
 const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
   en: "English",
   fr: "Français",
+  de: "Deutsch",
+  ar: "العربية",
   ja: "日本語",
   "zh-TW": "繁體中文",
+  zh: "简体中文",
 };
+type TargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse";
+const TARGET_LANG_LABELS: Record<TargetLang, string> = {
+  zh: "简体中文",
+  "zh-TW": "繁體中文",
+  en: "English",
+  ja: "日本語",
+  fr: "Français",
+  de: "Deutsch",
+  ar: "العربية",
+  morse: "摩斯密码",
+};
+const TARGET_LANG_KEY = "bilingual-editorial-target-lang";
+const ALL_TARGET_LANGS: TargetLang[] = ["zh", "zh-TW", "en", "ja", "fr", "de", "ar", "morse"];
+function readStoredTargetLang(): TargetLang {
+  try {
+    const t = localStorage.getItem(TARGET_LANG_KEY);
+    if (t && ALL_TARGET_LANGS.includes(t as TargetLang)) return t as TargetLang;
+  } catch {
+    /* ignore */
+  }
+  return "zh";
+}
 const SOURCE_LANG_KEY = "bilingual-editorial-source-lang";
+const ALL_SOURCE_LANGS: SourceLang[] = ["en", "fr", "de", "ar", "ja", "zh-TW", "zh"];
+function readStoredSourceLang(): SourceLang {
+  try {
+    const s = localStorage.getItem(SOURCE_LANG_KEY);
+    if (s && ALL_SOURCE_LANGS.includes(s as SourceLang)) return s as SourceLang;
+  } catch {
+    /* ignore */
+  }
+  return "en";
+}
+
+/** 根据正文抽样推断原文语种，用于上传/粘贴翻译时与提示词一致（避免日文内容仍按「英文」翻译） */
+function detectSourceLang(text: string): SourceLang {
+  const sample = text.slice(0, 6000);
+  const total = sample.replace(/\s/g, "").length;
+  if (total === 0) return "en";
+
+  const jp = (sample.match(/[\u3040-\u309f\u30a0-\u30ff]/g) ?? []).length;
+  const fr = (sample.match(/[àâæçéèêëïîôœùûüÿÀÂÆÇÉÈÊËÏÎÔŒÙÛÜŸ«»]/g) ?? []).length;
+  const cjk = (sample.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) ?? []).length;
+  const arScript = (sample.match(/[\u0600-\u06FF]/g) ?? []).length;
+
+  if (arScript >= 8 || arScript / Math.max(total, 1) > 0.04) return "ar";
+  if (jp >= 8 || jp / Math.max(total, 1) > 0.04) return "ja";
+  if (cjk / Math.max(total, 1) > 0.12) {
+    const trad = (sample.match(/[與個從來為說這還種麼對應學關點開國問題數經現實請過當無電業長門時書車東見發會費問買義馬區陽連運達邊選識護機關號環點傳聞開製紐統經際談請變農術認觀議質輸辦導歡歷齊齒壞搖損撥擊則競級約書費術導統議選護環識農齊齒歡歷壞損擊競臺灣匯整資訊]/g) ?? []).length;
+    return trad > 3 ? "zh-TW" : "zh";
+  }
+  if (fr / Math.max(total, 1) > 0.008) return "fr";
+  return "en";
+}
 const LOCAL_USERNAME_STORAGE = "bilingual-editorial-username";
 
 function readLocalUsernameBoot(): string | null {
@@ -46,31 +102,17 @@ function readLocalUsernameBoot(): string | null {
   }
 }
 
-function detectSourceLang(text: string): SourceLang {
-  const sample = text.slice(0, 2000);
-  const total = sample.replace(/\s/g, "").length;
-  if (total === 0) return "en";
-
-  // CJK Unified (Simplified + Traditional Chinese)
-  const cjk = (sample.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) ?? []).length;
-  // Japanese-specific: Hiragana + Katakana
-  const jp = (sample.match(/[\u3040-\u309f\u30a0-\u30ff]/g) ?? []).length;
-  // French-specific accented chars
-  const fr = (sample.match(/[àâæçéèêëïîôœùûüÿÀÂÆÇÉÈÊËÏÎÔŒÙÛÜŸ«»]/g) ?? []).length;
-
-  if (jp / total > 0.05) return "ja";
-  if (cjk / total > 0.15) {
-    // Distinguish Traditional vs Simplified by checking common trad-only chars
-    const trad = (sample.match(/[與個從來為說這還種麼對應學關點開國問題數經現實請過當無電業長門時書車東見發會費問買義馬區陽連運達邊選識護機關號環點傳聞開製紐統經際談請變農術認觀議質輸辦導歡歷齊齒壞搖損撥擊則競級約書費術導統議選護環識農齊齒歡歷壞損擊競]/g) ?? []).length;
-    return trad > 3 ? "zh-TW" : "en"; // Simplified Chinese is target, not source
-  }
-  if (fr / total > 0.01) return "fr";
-  return "en";
-}
-
 interface ParagraphPair {
   en: string;
   zh: string;
+}
+
+
+function getOriginalColumnText(pair: ParagraphPair, targetLang: TargetLang): string {
+  return targetLang === "en" ? pair.zh : pair.en;
+}
+function getTranslatedColumnText(pair: ParagraphPair, targetLang: TargetLang): string {
+  return targetLang === "en" ? pair.en : pair.zh;
 }
 
 interface AnalysisBilingual {
@@ -173,6 +215,7 @@ interface HistoryItem {
   /** 服务端根据 Clerk 解析后的展示名（username / 邮箱 / 姓名） */
   ownerDisplayName?: string;
   sourceLang?: SourceLang;
+  targetLang?: TargetLang;
   title: { zh: string; en: string };
   author: { zh: string; en: string };
   content: ParagraphPair[];
@@ -197,7 +240,7 @@ const DEMO_TITLE = { en: "To\nStéphane", zh: "致\n斯蒂芬" };
 const DEMO_AUTHOR = { en: "Eileen Myles", zh: "艾琳·迈尔斯" };
 const DEMO_CONTENT: ParagraphPair[] = [
   {
-    en: `Dear Stéphane,\nIt's your birthday. You'd be 61born in 61. I'm thinking of you as the stars fan out in the sky tonight as I walk my dog. It strikes me that the extreme head racket that occupies so much of your work is stellar: "Oy Suzy" there goes one, yet my feeling about the text written alongside one image or the flowers popped in around the jabber is that it is never very much about "one" speaking at all.`,
+    en: `Dear Stéphane,\nIt's your birthday. You'd be 61, born in '61. I'm thinking of you as the stars fan out in the sky tonight as I walk my dog. It strikes me that the extreme head racket that occupies so much of your work is stellar: "Oy Suzy" there goes one, yet my feeling about the text written alongside one image or the flowers popped in around the jabber is that it is never very much about "one" speaking at all.`,
     zh: `亲爱的斯蒂芬，\n今天是你的生日。你会61岁，出生于1961年。我在遛狗的时候，抬头看着天上星星点点，想着你。你的作品中充满了那种喧嚣的头脑轰鸣，让我想起星辰的闪烁。\u201C喂，苏西，\u201D一颗星滑落，但我感觉那些伴随图像而写的文字，或插入在喋喋不休中的花朵，从来都不是关于某个\u201C人\u201D在发声。`,
   },
   {
@@ -248,12 +291,21 @@ const DEMO_ANALYSIS: ArticleAnalysis = {
 export default function App() {
   const auth = useAppAuth();
   const [loginInput, setLoginInput] = useState("");
-  const [sourceLang, setSourceLang] = useState<SourceLang>(() =>
-    (localStorage.getItem(SOURCE_LANG_KEY) as SourceLang) || "en"
-  );
+  const [sourceLang, setSourceLang] = useState<SourceLang>(() => readStoredSourceLang());
+  const [targetLang, setTargetLang] = useState<TargetLang>(() => readStoredTargetLang());
+  /** 当前正文里 en/zh 两列的语义所对应的「译成」方向；仅在新翻译完成或打开历史时更新。勿用顶栏 targetLang 直接映射已存在的段落，否则仅切换下拉会错列。 */
+  const [contentPairTargetLang, setContentPairTargetLang] = useState<TargetLang>(() => readStoredTargetLang());
+  /** 与 contentPairTargetLang 对应，段落对在 storage 中「左栏 / 右栏」各用哪个键（用于搜索高亮 field） */
+  const pairLayoutOriginalField: "en" | "zh" = contentPairTargetLang === "en" ? "zh" : "en";
+  const pairLayoutTranslatedField: "en" | "zh" = contentPairTargetLang === "en" ? "en" : "zh";
 
   const isLoggedIn = auth.isLoaded && !!auth.userId;
   const localUserBoot = readLocalUsernameBoot();
+
+  /** 当前正文左栏实际语种（与本次 en/zh 数据一致）；栏目标题用此值，避免仅依赖 localStorage 的 sourceLang 与正文错位（如 Demo 英文左栏却显示「繁體中文」） */
+  const [contentPairSourceLang, setContentPairSourceLang] = useState<SourceLang | null>(() =>
+    readLocalUsernameBoot() ? null : "en"
+  );
 
   const [content, setContent] = useState<ParagraphPair[]>(() => (localUserBoot ? [] : DEMO_CONTENT));
   const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => (localUserBoot ? null : DEMO_ANALYSIS));
@@ -337,6 +389,8 @@ export default function App() {
       setTitle({ zh: "", en: "" });
       setAuthor({ zh: "", en: "" });
       setAnnotations([]);
+      setContentPairTargetLang(targetLang);
+      setContentPairSourceLang(null);
       setHistory((h) => h.map((item) => (item.username ? item : { ...item, username: cur })));
     } else {
       setContent(DEMO_CONTENT);
@@ -344,6 +398,8 @@ export default function App() {
       setTitle(DEMO_TITLE);
       setAuthor(DEMO_AUTHOR);
       setAnnotations([]);
+      setContentPairTargetLang(readStoredTargetLang());
+      setContentPairSourceLang("en");
     }
   }, [auth.isLoaded, auth.userId]);
 
@@ -476,7 +532,11 @@ export default function App() {
 
   const changeSourceLang = (lang: SourceLang) => {
     setSourceLang(lang);
-    localStorage.setItem(SOURCE_LANG_KEY, lang);
+    try {
+      localStorage.setItem(SOURCE_LANG_KEY, lang);
+    } catch {
+      /* ignore */
+    }
   };
 
   const isHistoryAdmin =
@@ -540,10 +600,15 @@ export default function App() {
     }
   }, [history]);
 
-  const saveToHistory = (item: Omit<HistoryItem, "id" | "createdAt" | "username" | "sourceLang">) => {
+  const saveToHistory = (
+    item: Omit<HistoryItem, "id" | "createdAt" | "username" | "sourceLang" | "targetLang">,
+    langForRecord?: { sourceLang: SourceLang; targetLang: TargetLang }
+  ) => {
     const id = crypto.randomUUID();
     const createdAt = Date.now();
-    const entry: HistoryItem = { ...item, id, createdAt, username: auth.userId || undefined, sourceLang };
+    const sl = langForRecord?.sourceLang ?? sourceLang;
+    const tl = langForRecord?.targetLang ?? targetLang;
+    const entry: HistoryItem = { ...item, id, createdAt, username: auth.userId || undefined, sourceLang: sl, targetLang: tl };
     setHistory((prev) => [entry, ...prev.slice(0, historyCap - 1)]);
 
     if (storageMode === "cloud") {
@@ -554,7 +619,7 @@ export default function App() {
         fetch("/api/history", {
           method: "POST",
           headers,
-          body: JSON.stringify({ ...item, id, createdAt, username: auth.userId || undefined, sourceLang }),
+          body: JSON.stringify({ ...item, id, createdAt, username: auth.userId || undefined, sourceLang: sl, targetLang: tl }),
         }).catch(() => {});
       })();
     }
@@ -565,6 +630,13 @@ export default function App() {
     setAnalysis(normalizeAnalysis(item.analysis) ?? item.analysis ?? null);
     setTitle(item.title);
     setAuthor(item.author);
+    if (item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang)) setSourceLang(item.sourceLang);
+    const t = item.targetLang && ALL_TARGET_LANGS.includes(item.targetLang) ? item.targetLang : "zh";
+    setTargetLang(t);
+    setContentPairTargetLang(t);
+    setContentPairSourceLang(
+      item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang) ? item.sourceLang : "en"
+    );
     setAnnotations(item.annotations ?? []);
     setCurrentHistoryId(item.id);
     setActiveAnnotationId(null);
@@ -651,11 +723,11 @@ export default function App() {
     if (!selectedText) return;
 
     // Find the paragraph container element
-    const paraEl = document.querySelector(`[data-para-en="${paraIndex}"]`);
+    const paraEl = document.querySelector(`[data-para-original="${paraIndex}"]`);
     if (!paraEl || !paraEl.contains(range.startContainer)) return;
 
     // Calculate character offsets within the paragraph text
-    const fullText = content[paraIndex]?.en || "";
+    const fullText = getOriginalColumnText(content[paraIndex] ?? { en: "", zh: "" }, contentPairTargetLang);
     const preRange = document.createRange();
     preRange.selectNodeContents(paraEl);
     preRange.setEnd(range.startContainer, range.startOffset);
@@ -673,7 +745,7 @@ export default function App() {
   const renderAnnotatedText = (text: string, paraIndex: number) => {
     const paraAnns = getParaAnnotations(paraIndex);
     if (paraAnns.length === 0) {
-      return <span>{renderSearchHighlightedText(text, paraIndex, "en")}</span>;
+      return <span>{renderSearchHighlightedText(text, paraIndex, pairLayoutOriginalField)}</span>;
     }
 
     const segments: React.ReactNode[] = [];
@@ -682,7 +754,7 @@ export default function App() {
     paraAnns.forEach((ann) => {
       // Add plain text before this annotation (with search highlight)
       if (ann.startOffset > lastEnd) {
-        segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd, ann.startOffset), paraIndex, "en", lastEnd)}</span>);
+        segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd, ann.startOffset), paraIndex, pairLayoutOriginalField, lastEnd)}</span>);
       }
       // Add highlighted annotation span
       const isActive = activeAnnotationId === ann.id;
@@ -713,7 +785,7 @@ export default function App() {
 
     // Add remaining text (with search highlight)
     if (lastEnd < text.length) {
-      segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd), paraIndex, "en", lastEnd)}</span>);
+      segments.push(<span key={`t-${lastEnd}`}>{renderSearchHighlightedText(text.slice(lastEnd), paraIndex, pairLayoutOriginalField, lastEnd)}</span>);
     }
 
     return <>{segments}</>;
@@ -721,7 +793,7 @@ export default function App() {
 
   const handleExportDocx = async () => {
     const { exportToDocx } = await import("./exportDocx");
-    await exportToDocx({ title, author, content, annotations, analysis, originalDocx });
+    await exportToDocx({ title, author, content, annotations, analysis, originalDocx, targetLang: contentPairTargetLang });
   };
 
   type TranslateResult = { translation: ParagraphPair[]; analysis: ArticleAnalysis; title?: { en: string; zh: string }; author?: { en: string; zh: string } };
@@ -730,16 +802,25 @@ export default function App() {
     paragraphs: string[],
     onProgress: (p: { percent: number; step: string }) => void,
     srcLang: string = "en",
+    tgtLang: TargetLang = "zh",
     onChunkDone?: (partial: { pairs: ParagraphPair[]; chunkIndex: number; title?: { en: string; zh: string }; author?: { en: string; zh: string }; analysis?: ArticleAnalysis | null }) => void
   ): Promise<TranslateResult> => {
     const res = await fetch("/api/translate-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paragraphs, sourceLang: srcLang, sourceLangFull: srcLang }),
+      body: JSON.stringify({ paragraphs, sourceLang: srcLang, sourceLangFull: srcLang, targetLang: tgtLang }),
     });
 
     if (!res.ok || !res.body) {
-      throw new Error(`流式接口不可用 (${res.status})`);
+      const errText = await res.text().catch(() => "");
+      let msg = `流式接口不可用 (${res.status})`;
+      try {
+        const j = errText ? JSON.parse(errText) : {};
+        if (j && typeof j.error === "string" && j.error) msg = j.error;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
     }
 
     const reader = res.body.getReader();
@@ -783,13 +864,13 @@ export default function App() {
     throw new Error("模型返回格式异常，请重试");
   };
 
-  const translateAndAnalyze = async (paragraphs: string[], srcLang: string = "en"): Promise<TranslateResult> => {
+  const translateAndAnalyze = async (paragraphs: string[], srcLang: string = "en", tgtLang: TargetLang = "zh"): Promise<TranslateResult> => {
     let res: Response;
     try {
       res = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ paragraphs, sourceLang: srcLang, sourceLangFull: srcLang }),
+        body: JSON.stringify({ paragraphs, sourceLang: srcLang, sourceLangFull: srcLang, targetLang: tgtLang }),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -832,24 +913,12 @@ export default function App() {
     return result;
   };
 
-  // Shared: parse text into paragraphs and run translation
-  const runTranslation = async (text: string) => {
-    // Auto-detect source language and update selector
-    const detected = detectSourceLang(text);
-    changeSourceLang(detected);
-
-    setProgress({ percent: 15, step: "正在提取段落..." });
-    let paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
-    if (paragraphs.length <= 1 || paragraphs.some(p => p.length > 5000)) {
-      const byLines = text.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
-      if (byLines.length > paragraphs.length) paragraphs = byLines;
-    }
-
+  /** 对已分段的原文调用翻译（不自动识别语言；用于重新翻译或粘贴流程的后半段） */
+  const runTranslationCore = async (paragraphs: string[], apiSourceLang: SourceLang, usedTargetLang: TargetLang) => {
     if (paragraphs.length === 0) {
       throw new Error("文档内容为空");
     }
 
-    const apiSourceLang = detected;
     setContent([]);
 
     let result: TranslateResult;
@@ -858,6 +927,7 @@ export default function App() {
         paragraphs,
         (p) => setProgress(p),
         apiSourceLang,
+        usedTargetLang,
         (partial) => {
           if (partial.chunkIndex === 1) {
             setContent(partial.pairs);
@@ -876,7 +946,7 @@ export default function App() {
         setProgress({ percent: fallbackPercent, step: "翻译中..." });
       }, 1500);
       try {
-        result = await translateAndAnalyze(paragraphs, apiSourceLang);
+        result = await translateAndAnalyze(paragraphs, apiSourceLang, usedTargetLang);
       } finally {
         clearInterval(fallbackTimer);
       }
@@ -892,8 +962,86 @@ export default function App() {
     setAnnotations([]);
     setActiveAnnotationId(null);
     setPendingSelection(null);
-    saveToHistory({ title: newTitle, author: newAuthor, content: result.translation, analysis: result.analysis, annotations: [] });
+    saveToHistory(
+      { title: newTitle, author: newAuthor, content: result.translation, analysis: result.analysis, annotations: [] },
+      { sourceLang: apiSourceLang, targetLang: usedTargetLang }
+    );
+    setContentPairSourceLang(apiSourceLang);
+    setContentPairTargetLang(usedTargetLang);
     setProgress({ percent: 100, step: "完成" });
+  };
+
+  /** 顶栏切换译文语言时：用左栏原文 + 新选语言整篇重译（沿用 Import 中的原文语言） */
+  const retranslateToTarget = async (nextTarget: TargetLang) => {
+    if (content.length === 0 || nextTarget === contentPairTargetLang) return;
+
+    const paragraphs = content.map((p) => getOriginalColumnText(p, contentPairTargetLang)).map((s) => s.trim());
+    if (paragraphs.every((p) => !p)) {
+      setError("无法从当前正文提取原文，请重新导入或粘贴后再试。");
+      setTargetLang(contentPairTargetLang);
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, contentPairTargetLang);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    setIsTranslating(true);
+    setError(null);
+    setAnalysis(null);
+    setProgress({ percent: 10, step: "正在按新译文语言重新翻译..." });
+
+    try {
+      await runTranslationCore(paragraphs, sourceLang, nextTarget);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg || "重新翻译失败");
+      setTargetLang(contentPairTargetLang);
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, contentPairTargetLang);
+      } catch {
+        /* ignore */
+      }
+    } finally {
+      setIsTranslating(false);
+      setProgress(null);
+    }
+  };
+
+  const changeTargetLang = (lang: TargetLang) => {
+    setTargetLang(lang);
+    try {
+      localStorage.setItem(TARGET_LANG_KEY, lang);
+    } catch {
+      /* ignore */
+    }
+    if (isTranslating) return;
+    if (content.length > 0 && lang !== contentPairTargetLang) {
+      void retranslateToTarget(lang);
+    }
+  };
+
+  // Shared: parse text into paragraphs and run translation（新稿：自动识别原文语言）
+  const runTranslation = async (text: string) => {
+    const usedTargetLang = targetLang;
+    setProgress({ percent: 15, step: "正在提取段落..." });
+    let paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+    if (paragraphs.length <= 1 || paragraphs.some(p => p.length > 5000)) {
+      const byLines = text.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
+      if (byLines.length > paragraphs.length) paragraphs = byLines;
+    }
+
+    if (paragraphs.length === 0) {
+      throw new Error("文档内容为空");
+    }
+
+    const detected = detectSourceLang(text);
+    changeSourceLang(detected);
+    const apiSourceLang = detected;
+
+    setProgress({ percent: 18, step: "正在翻译..." });
+    await runTranslationCore(paragraphs, apiSourceLang, usedTargetLang);
   };
 
   const handleFileUpload = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1016,15 +1164,23 @@ export default function App() {
                 <Search className="w-4.5 h-4.5 text-ink/40 hover:text-vibrant-1 transition-colors" />
               </button>
             )}
-            {/* Language selector */}
+            {/* 仅「译成」可选：简体 / 繁体 / English；原文语种由正文自动识别（见正文区标签） */}
+            <span className="text-[10px] font-sans text-ink/40 shrink-0" title="你要翻译成哪种语言">
+              译成
+            </span>
             <div className="relative">
               <select
-                value={sourceLang}
-                onChange={(e) => changeSourceLang(e.target.value as SourceLang)}
-                className="appearance-none bg-transparent pl-7 pr-6 py-1.5 text-xs font-sans font-medium text-ink/60 hover:text-ink cursor-pointer outline-none border border-ink/10 rounded-full hover:border-ink/20 transition-colors"
+                value={targetLang}
+                onChange={(e) => changeTargetLang(e.target.value as TargetLang)}
+                disabled={isTranslating}
+                title={`译文语言：${TARGET_LANG_LABELS[targetLang]}。新导入/粘贴的翻译使用该语言；若已有正文，切换语言后将按左栏原文自动重新翻译。`}
+                aria-label={`译文 ${TARGET_LANG_LABELS[targetLang]}`}
+                className="appearance-none bg-transparent pl-7 pr-6 py-1.5 text-xs font-sans font-medium text-ink/60 hover:text-ink cursor-pointer outline-none border border-ink/10 rounded-full hover:border-ink/20 transition-colors disabled:opacity-40 disabled:pointer-events-none"
               >
-                {(Object.entries(SOURCE_LANG_LABELS) as [SourceLang, string][]).map(([k, v]) => (
-                  <option key={k} value={k}>{v}</option>
+                {(Object.entries(TARGET_LANG_LABELS) as [TargetLang, string][]).map(([k, v]) => (
+                  <option key={k} value={k} title={v}>
+                    {v}
+                  </option>
                 ))}
               </select>
               <Globe className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink/40 pointer-events-none" />
@@ -1248,7 +1404,7 @@ export default function App() {
                 <div className="space-y-6 text-sm font-sans text-ink/70 leading-relaxed">
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">用途</h3>
-                    <p>一个面向文学文本的双语翻译与分析工具。上传或粘贴外文文档，自动翻译为简体中文，并生成结构化的文学分析，包括剧情梗概、人物介绍、写作优缺点等。</p>
+                    <p>一个面向文学文本的双语翻译与分析工具。上传或粘贴文档，在顶栏选择译文语言（默认简体中文），并生成结构化的文学分析，包括剧情梗概、人物介绍、写作优缺点等。</p>
                   </div>
 
                   <div>
@@ -1259,7 +1415,7 @@ export default function App() {
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">核心功能</h3>
                     <ul className="space-y-2">
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 支持粘贴文本或上传 Word / PDF 文件，AI 自动翻译为简体中文</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 顶栏「译成」选择目标语言；原文语种由正文自动识别，无需手选</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>文学分析 — 自动生成双语摘要、叙事分析、核心主题、剧情梗概、人物介绍、写作优缺点</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>批注 — 选中原文段落中的任意文本，添加批注（类似 Word 批注功能）</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>导出 — 一键导出为 Word 文档（.docx），批注保留为 Word 原生批注</li>
@@ -1379,7 +1535,6 @@ export default function App() {
       </AnimatePresence>
 
       <main className="max-w-6xl mx-auto px-6 py-16 md:py-32 relative z-10">
-        {/* Error Message */}
         <AnimatePresence>
           {error && (
             <motion.div 
@@ -1404,12 +1559,12 @@ export default function App() {
               className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24"
             >
               <div className="space-y-6">
-                <h2 className="book-title-en whitespace-pre-line">{title.en}</h2>
-                <p className="text-xl font-serif opacity-60 italic">{author.en}</p>
+                <h2 className={`${contentPairTargetLang === "en" ? "book-title-zh" : "book-title-en"} whitespace-pre-line`}>{contentPairTargetLang === "en" ? title.zh : title.en}</h2>
+                <p className={`text-xl opacity-60 ${contentPairTargetLang === "en" ? "font-serif-zh tracking-widest" : "font-serif italic"}`}>{contentPairTargetLang === "en" ? author.zh : author.en}</p>
               </div>
               <div className="space-y-6">
-                <h2 className="book-title-zh whitespace-pre-line">{title.zh}</h2>
-                <p className="text-xl font-serif-zh opacity-60 tracking-widest">{author.zh}</p>
+                <h2 className={`${contentPairTargetLang === "en" ? "book-title-en" : "book-title-zh"} whitespace-pre-line`}>{contentPairTargetLang === "en" ? title.en : title.zh}</h2>
+                <p className={`text-xl opacity-60 ${contentPairTargetLang === "en" ? "font-serif italic" : "font-serif-zh tracking-widest"}`}>{contentPairTargetLang === "en" ? author.en : author.zh}</p>
               </div>
             </motion.div>
           </header>
@@ -1462,8 +1617,14 @@ export default function App() {
             <article className="space-y-16">
               {/* Column labels */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 mb-2">
-                <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">{SOURCE_LANG_LABELS[sourceLang] || "Source"}</span>
-                <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">简体中文</span>
+                <div>
+                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">
+                    {SOURCE_LANG_LABELS[contentPairSourceLang ?? sourceLang] || "Source"}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">{TARGET_LANG_LABELS[contentPairTargetLang]}</span>
+                </div>
               </div>
               {content.map((pair, paraIndex) => {
                 const paraAnns = getParaAnnotations(paraIndex);
@@ -1479,18 +1640,28 @@ export default function App() {
                   transition={{ duration: 1.5, ease: [0.22, 1, 0.36, 1] }}
                 >
                   <div className="relative grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 items-start">
-                    {/* English Side — select text to annotate */}
+                    {/* 原文 — 选字批注 */}
                     <div
                       className="content-text whitespace-pre-wrap text-ink/80"
-                      data-para-en={paraIndex}
+                      data-para-original={paraIndex}
                       onMouseUp={() => handleTextSelect(paraIndex)}
                     >
-                      {renderAnnotatedText(pair.en, paraIndex)}
+                      {renderAnnotatedText(
+                        getOriginalColumnText(pair, contentPairTargetLang),
+                        paraIndex
+                      )}
                     </div>
 
-                    {/* Chinese Side */}
-                    <div className="content-text content-text-zh whitespace-pre-wrap">
-                      {renderSearchHighlightedText(pair.zh, paraIndex, "zh")}
+                    {/* 译文 */}
+                    <div
+                      className={`content-text whitespace-pre-wrap ${contentPairTargetLang === "morse" ? "font-mono text-sm tracking-tight" : "content-text-zh"}`}
+                      dir={contentPairTargetLang === "ar" ? "rtl" : undefined}
+                    >
+                      {renderSearchHighlightedText(
+                        getTranslatedColumnText(pair, contentPairTargetLang),
+                        paraIndex,
+                        pairLayoutTranslatedField
+                      )}
                     </div>
                   </div>
 
