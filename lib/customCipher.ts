@@ -7,8 +7,6 @@
 
 import { pinyin } from "pinyin-pro";
 import { applyBracketPinyinToHanzi } from "./akiPinyinToZh";
-import { buildAkiEasterEgg, matchAkiEasterEggSource } from "./akiEasterEggs";
-
 const CHAR_TO_AKI: Record<string, string> = {
   a: "🐥", b: "🐻", c: "🐱", d: "🐶", e: "🐘", f: "🦊",
   g: "🐸", h: "🐹", i: "🦔", j: "🐙", k: "🦘", l: "🦁",
@@ -85,6 +83,18 @@ export function extractAkiCipherFromTranslatedParagraph(block: string): string {
   const t = block.replace(/\r\n/g, "\n").trim();
   if (!t) return "";
   return t.split(/\n\n+/)[0]?.trim() ?? "";
+}
+
+/**
+ * 粘贴的 AKI 栏：首段为密文（至第一个空行块），其后为彩蛋中文/英文等；解码时只应对密文段调用 decodeAki。
+ */
+export function splitAkiPasteIntoCipherAndEgg(block: string): { cipherBlock: string; eggTail: string } {
+  const t = block.replace(/\r\n/g, "\n").trim();
+  if (!t) return { cipherBlock: "", eggTail: "" };
+  const parts = t.split(/\n\n+/);
+  const cipherBlock = parts[0]?.trim() ?? "";
+  const eggTail = parts.slice(1).join("\n\n").trim();
+  return { cipherBlock, eggTail };
 }
 
 /** 单词间分隔符 */
@@ -275,31 +285,3 @@ export function isProbablyAkiCipher(raw: string): boolean {
   return unknown === 0 && decodableUnits >= 1;
 }
 
-/** 单段原文 → 译文栏 AKI 展示（含彩蛋）。paragraphIndex===0 时加【aki码】前缀。 */
-export function encodeSourceParagraphToAkiColumn(sourceParagraph: string, paragraphIndex = 0): string {
-  const egg = matchAkiEasterEggSource(sourceParagraph);
-  if (egg !== null) return buildAkiEasterEgg(egg, { encodeAki, wrapAkiDisplay });
-  const raw = encodeAki(sourceParagraph);
-  const aki = wrapAkiDisplayIfFirst(raw, paragraphIndex === 0);
-  return aki !== "" ? aki : "—";
-}
-
-/**
- * 将翻译对的译文栏编码为 AKI码。
- * @param layout 与 mergeTranslation 一致：to_cjk 时原文在 pair.en；to_en 时原文在 pair.zh（用于彩蛋匹配）
- */
-export function applyAkiEncodingToPairs(
-  pairs: { en: string; zh: string }[],
-  layout: "to_cjk" | "to_en" = "to_cjk"
-): { en: string; zh: string }[] {
-  return pairs.map((p, i) => {
-    const sourceText = layout === "to_cjk" ? p.en : p.zh;
-    const egg = matchAkiEasterEggSource(sourceText);
-    if (egg !== null) {
-      return { en: p.en, zh: buildAkiEasterEgg(egg, { encodeAki, wrapAkiDisplay }) };
-    }
-    const raw = encodeAki(p.zh);
-    const aki = wrapAkiDisplayIfFirst(raw, i === 0);
-    return { en: p.en, zh: aki !== "" ? aki : "—" };
-  });
-}

@@ -5,6 +5,9 @@
 
 import { UNIVERSITY_ROWS, type UniVariation } from "./uniEasterData";
 
+/** AKI 静态白名单高校：仅这两条的 match 仍走本地随机梗；其余高校名改由 LLM 动态生成 */
+const AKI_STATIC_UNI_MATCH_KEYS = new Set(["中央戏剧学院", "明治大学"]);
+
 export type AkiEasterKind = "hku" | "i_love_you" | "aki_name";
 
 /** 匹配结果：旧版关键词或高校彩蛋 */
@@ -22,8 +25,8 @@ type EasterTriple = {
 const EASTER_TRIPLE: Record<AkiEasterKind, EasterTriple> = {
   hku: {
     cipherSource: "HKU",
-    zh: "AKI正在这里读大学，不要再排队了！",
-    en: "AKI is studying here—don't want to queue any more!",
+    zh: "AKI正在这里读大学，不要再排队了！毕竟你是QS亚洲第一☝️",
+    en: "AKI is studying here—don't want to queue any more! After all, you're QS Asia #1 ☝️",
   },
   i_love_you: {
     cipherSource: "maki",
@@ -61,29 +64,70 @@ function uniRowMatchEquals(normalizedInput: string, matchKey: string): boolean {
   return false;
 }
 
-export function matchAkiEasterEggSource(raw: string): AkiEasterMatch | null {
+/** 是否与 legacy HKU 彩蛋同键（hku / 香港大学），用于「首次静态、再次走动态梗」 */
+/** 英文爱情触发词：i love you / i love u 等同；已 normalize + toLowerCase */
+function matchesLegacyILoveYouPhrase(lower: string, tNormalized: string): boolean {
+  if (tNormalized === "我爱你") return true;
+  return lower === "i love you" || lower === "i love u";
+}
+
+/** 与 i_love_you 彩蛋同键：整段为 maki（大小写不敏感，即 maki=MAKI） */
+function matchesLegacyMakiKeyword(lower: string): boolean {
+  return lower === "maki";
+}
+
+/** 与 aki_name 彩蛋同键：整段为 aki（大小写不敏感，即 aki=AKI） */
+function matchesLegacyAkiNameKeyword(lower: string): boolean {
+  return lower === "aki";
+}
+
+export function isLegacyHkuInput(raw: string): boolean {
+  const t = normalizeEasterInput(raw);
+  if (!t) return false;
+  const lower = t.toLowerCase();
+  return lower === "hku" || t === "香港大学";
+}
+
+export function matchAkiEasterEggSource(
+  raw: string,
+  options?: { skipLegacyHku?: boolean }
+): AkiEasterMatch | null {
   const t = normalizeEasterInput(raw);
   if (!t) return null;
 
+  const lower = t.toLowerCase();
+  /** 与 HKU 同彩蛋：英文缩写或「香港大学」整段匹配；skipLegacyHku 时改走与其他高校相同的动态生成 */
+  if (!options?.skipLegacyHku && (lower === "hku" || t === "香港大学")) {
+    return { type: "legacy", kind: "hku" };
+  }
+  if (matchesLegacyILoveYouPhrase(lower, t) || matchesLegacyMakiKeyword(lower)) {
+    return { type: "legacy", kind: "i_love_you" };
+  }
+  if (matchesLegacyAkiNameKeyword(lower)) {
+    return { type: "legacy", kind: "aki_name" };
+  }
+
   for (const row of UNIVERSITY_ROWS) {
+    if (!AKI_STATIC_UNI_MATCH_KEYS.has(row.match)) continue;
     if (uniRowMatchEquals(t, row.match)) {
       return { type: "uni", official: row.match, variations: row.variations };
     }
   }
 
-  const lower = t.toLowerCase();
-  if (lower === "hku") return { type: "legacy", kind: "hku" };
-  if (lower === "i love you" || t === "我爱你") return { type: "legacy", kind: "i_love_you" };
-  if (lower === "aki") return { type: "legacy", kind: "aki_name" };
   return null;
 }
 
-function formatTripleLanguageEgg(
-  triple: EasterTriple,
-  deps: { encodeAki: (text: string) => string; wrapAkiDisplay: (body: string) => string }
+/** 第一行 AKI 密文 + 空行 + 中文 + 空行 + 英文（彩蛋与动态梗共用） */
+export function formatTripleLanguageEgg(
+  triple: { cipherSource: string; zh: string; en: string },
+  deps: {
+    encodeAki: (text: string) => string;
+    /** 对已编码密文行加展示包装（如 `wrapAkiDisplay` 或按段落索引的 `wrapAkiDisplayIfFirst`） */
+    wrapCipherLine: (encodedBody: string) => string;
+  }
 ): string {
   const raw = deps.encodeAki(triple.cipherSource);
-  const code = deps.wrapAkiDisplay(raw) || "—";
+  const code = deps.wrapCipherLine(raw) || "—";
   const zh = triple.zh.trim();
   const en = triple.en.trim();
   if (zh === en) {
@@ -99,7 +143,7 @@ function pickRandomVariation(vars: UniVariation[]): UniVariation {
 function buildUniversityEgg(
   official: string,
   variations: UniVariation[],
-  deps: { encodeAki: (text: string) => string; wrapAkiDisplay: (body: string) => string }
+  deps: { encodeAki: (text: string) => string; wrapCipherLine: (body: string) => string }
 ): string {
   const v = pickRandomVariation(variations);
   /** 密文对「校名」编码；下方中英文为彩蛋梗，与密文语义不必一致 */
@@ -108,7 +152,7 @@ function buildUniversityEgg(
 
 export function buildAkiEasterEgg(
   match: AkiEasterMatch,
-  deps: { encodeAki: (text: string) => string; wrapAkiDisplay: (body: string) => string }
+  deps: { encodeAki: (text: string) => string; wrapCipherLine: (body: string) => string }
 ): string {
   if (match.type === "legacy") {
     return formatTripleLanguageEgg(EASTER_TRIPLE[match.kind], deps);

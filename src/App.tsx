@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback, ChangeEvent } from "react";
+import { isLegacyHkuInput } from "../lib/akiEasterEggs";
 import { motion, AnimatePresence } from "motion/react";
 import { BookOpen, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle, Search, ChevronUp } from "lucide-react";
 import mammoth from "mammoth";
@@ -12,12 +13,13 @@ import FloatingTextFollowup from "./FloatingTextFollowup";
 import { useAppAuth } from "./auth/AppAuthContext";
 import {
   decodeAki,
-  encodeSourceParagraphToAkiColumn,
   AKI_SITE_URL,
   extractAkiCipherFromTranslatedParagraph,
   isProbablyAkiCipher,
   prepareAkiImportText,
+  splitAkiPasteIntoCipherAndEgg,
 } from "../lib/customCipher";
+import { buildAkiTranslatedColumnAsync } from "../lib/akiTranslatedColumn";
 import { mergeRefinedParagraphs, shouldRefineDecodedAkiText } from "../lib/refineAkiZh";
 import { stripUrlsForTranslation } from "../lib/stripUrlsForTranslation";
 import {
@@ -68,6 +70,7 @@ const TARGET_LANG_LABELS: Record<TargetLang, string> = {
 };
 const TARGET_LANG_KEY = "bilingual-editorial-target-lang";
 const ALL_TARGET_LANGS: TargetLang[] = ["zh", "zh-TW", "en", "ja", "fr", "de", "ar", "morse", "aki"];
+/** 未保存过目标语时：游客默认「译成 AKI 码」；登录用户见下方 useLayoutEffect 回落为简体中文 */
 function readStoredTargetLang(): TargetLang {
   try {
     const t = localStorage.getItem(TARGET_LANG_KEY);
@@ -75,7 +78,7 @@ function readStoredTargetLang(): TargetLang {
   } catch {
     /* ignore */
   }
-  return "zh";
+  return "aki";
 }
 const SOURCE_LANG_KEY = "bilingual-editorial-source-lang";
 /** 用户可选 / 历史记录中的原文语种（不含仅用于栏目标题的 aki） */
@@ -397,6 +400,35 @@ export default function App() {
   };
 
   const authUserPrevRef = useRef<string | null | undefined>(undefined);
+  /** 本会话内是否已用过 HKU 静态彩蛋；再次输入 hku/香港大学则走 LLM 动态梗（与同批后续段落一致） */
+  const hkuStaticEggConsumedRef = useRef(false);
+
+  /** 从未选过目标语时：游客保持默认 AKI；已登录用户回落为简体中文（与历史产品习惯一致） */
+  useLayoutEffect(() => {
+    if (!auth.isLoaded) return;
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem(TARGET_LANG_KEY);
+    } catch {
+      return;
+    }
+    if (stored !== null) return;
+    if (auth.userId) {
+      setTargetLang("zh");
+      setContentPairTargetLang("zh");
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, "zh");
+      } catch {
+        /* ignore */
+      }
+    } else {
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, "aki");
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [auth.isLoaded, auth.userId]);
 
   useLayoutEffect(() => {
     if (!auth.isLoaded) return;
@@ -997,13 +1029,47 @@ export default function App() {
 
     setContent([]);
 
-    // AKI码 快捷路径：任何语言→AKI 直接前端编码，不走 API
+    // AKI码 快捷路径：任何语言→AKI 直接前端编码，不走翻译 API（动态梗走 /api/aki-meme）
     if (usedTargetLang === "aki") {
-      setProgress({ percent: 50, step: "正在编码为 AKI码..." });
-      const translation = paragraphs.map((p, idx) => ({
-        en: p,
-        zh: encodeSourceParagraphToAkiColumn(p, idx),
-      }));
+      setProgress({ percent: 40, step: "正在翻译..." });
+      const fetchMeme = async (text: string) => {
+        try {
+          const r = await fetch("/api/aki-meme", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          if (!r.ok) return null;
+          const j = (await r.json()) as { eligible?: boolean; zh?: string; en?: string };
+          if (j.eligible === false) return null;
+          const zh = String(j.zh ?? "").trim();
+          const en = String(j.en ?? "").trim();
+          if (!zh) return null;
+          return { zh, en };
+        } catch {
+          return null;
+        }
+      };
+      const sessionHkuConsumed = hkuStaticEggConsumedRef.current;
+      const translation = await Promise.all(
+        paragraphs.map((p, idx) => {
+          const priorHkuInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyHkuInput(pr)).length;
+          const skipLegacyHku =
+            isLegacyHkuInput(p) && (priorHkuInDoc > 0 || sessionHkuConsumed);
+          return buildAkiTranslatedColumnAsync(p, idx, fetchMeme, { skipLegacyHku }).then((zh) => ({
+            en: p,
+            zh,
+          }));
+        })
+      );
+      const showedStaticHkuThisJob = paragraphs.some((p, idx) => {
+        const priorHkuInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyHkuInput(pr)).length;
+        const skip = isLegacyHkuInput(p) && (priorHkuInDoc > 0 || sessionHkuConsumed);
+        return isLegacyHkuInput(p) && !skip;
+      });
+      if (showedStaticHkuThisJob) {
+        hkuStaticEggConsumedRef.current = true;
+      }
       const result: TranslateResult = {
         title: { en: "—", zh: "—" },
         author: { en: "—", zh: "—" },
@@ -1084,7 +1150,14 @@ export default function App() {
   const retranslateToTarget = async (nextTarget: TargetLang) => {
     if (content.length === 0 || nextTarget === contentPairTargetLang) return;
 
-    const paragraphs = content.map((p) => getOriginalColumnText(p, contentPairTargetLang)).map((s) => s.trim());
+    const fromAkiDecode = contentPairSourceLang === "aki" && contentPairTargetLang === "zh";
+    const apiSourceLang: SourceLang = fromAkiDecode ? "zh" : sourceLang;
+
+    const paragraphs = content
+      .map((p) =>
+        fromAkiDecode ? getTranslatedColumnText(p, "zh") : getOriginalColumnText(p, contentPairTargetLang)
+      )
+      .map((s) => s.trim());
     if (paragraphs.every((p) => !p)) {
       setError("无法从当前正文提取原文，请重新导入或粘贴后再试。");
       setTargetLang(contentPairTargetLang);
@@ -1115,7 +1188,10 @@ export default function App() {
     setProgress({ percent: 10, step: "正在按新译文语言重新翻译..." });
 
     try {
-      await runTranslationCore(paragraphs, sourceLang, nextTarget);
+      if (fromAkiDecode) {
+        setSourceLang("zh");
+      }
+      await runTranslationCore(paragraphs, apiSourceLang, nextTarget);
       incrementGuestTranslationSuccessIfVisitor(loggedInRt);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1173,26 +1249,37 @@ export default function App() {
       if (paragraphs.length === 0) throw new Error("文档内容为空");
 
       setProgress({ percent: 50, step: "正在解码 AKI码..." });
-      const roughZh = paragraphs.map((p) => decodeAki(p) || "—");
-      let zhList = roughZh;
-      if (roughZh.some(shouldRefineDecodedAkiText)) {
+      const eggTails: string[] = [];
+      const roughMains = paragraphs.map((p) => {
+        const { cipherBlock, eggTail } = splitAkiPasteIntoCipherAndEgg(p);
+        eggTails.push(eggTail);
+        return decodeAki(cipherBlock) || "—";
+      });
+      let refinedMains = roughMains;
+      if (roughMains.some(shouldRefineDecodedAkiText)) {
         setProgress({ percent: 62, step: "正在用模型修正中文…" });
         try {
           const res = await fetch("/api/refine-zh", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ paragraphs: roughZh }),
+            body: JSON.stringify({ paragraphs: roughMains }),
           });
           if (res.ok) {
             const data = (await res.json()) as { paragraphs?: unknown };
             if (Array.isArray(data.paragraphs)) {
-              zhList = mergeRefinedParagraphs(roughZh, data.paragraphs);
+              refinedMains = mergeRefinedParagraphs(roughMains, data.paragraphs);
             }
           }
         } catch {
           /* 离线或未配置 API：保留本地拼音还原结果 */
         }
       }
+      const zhList = paragraphs.map((_p, i) => {
+        const main = refinedMains[i] ?? roughMains[i] ?? "—";
+        const tail = eggTails[i]?.trim();
+        if (!tail) return main;
+        return [main, tail].join("\n\n");
+      });
       const translation = paragraphs.map((p, i) => ({
         en: p,
         zh: zhList[i] ?? "—",
@@ -1208,7 +1295,7 @@ export default function App() {
       setPendingSelection(null);
       setContentPairSourceLang("aki");
       setContentPairTargetLang("zh");
-      setSourceLang("en");
+      setSourceLang("zh");
       setTargetLang("zh");
       try {
         localStorage.setItem(TARGET_LANG_KEY, "zh");
@@ -1217,7 +1304,7 @@ export default function App() {
       }
       saveToHistory(
         { title: newTitle, author: newAuthor, content: translation, analysis: null, annotations: [] },
-        { sourceLang: "en", targetLang: "zh" }
+        { sourceLang: "aki", targetLang: "zh" }
       );
       setProgress({ percent: 100, step: "完成" });
       incrementGuestTranslationSuccessIfVisitor(loggedIn);
@@ -1606,7 +1693,7 @@ export default function App() {
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">用途</h3>
                     <p className="text-ink/85 font-medium mb-2">试试彩蛋吧！</p>
                     <p>
-                      面向文学文本的<strong>双语翻译与结构化分析</strong>：上传或粘贴文档，在顶栏「译成」选择目标语言（默认简体中文），生成双语对照与文学分析，包括剧情梗概、人物介绍、写作优缺点等。
+                      面向文学文本的<strong>双语翻译与结构化分析</strong>：上传或粘贴文档，在顶栏「译成」选择目标语言（未选过时游客默认为 <strong>AKI 码</strong>；登录用户默认为简体中文），生成双语对照与文学分析，包括剧情梗概、人物介绍、写作优缺点等。
                       另可将正文译为<strong>本站专属的 AKI 动物密文</strong>（字母与拼音对应小动物 emoji），或<strong>直接粘贴密文</strong>，由站内规则一键解码回中文。
                     </p>
                   </div>
@@ -1624,7 +1711,7 @@ export default function App() {
                     <ul className="space-y-2">
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 顶栏「译成」选择目标语言；原文语种由正文自动识别</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>文学分析 — 目标为自然语言时，自动生成双语摘要、叙事分析、核心主题、剧情梗概、人物介绍、写作优缺点</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>AKI 码 — 编码为动物密文；粘贴纯密文自动解码；彩蛋关键词与部分校名有隐藏梗；列头「复制」可拷贝密文与本站链接</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>AKI 码 — 编码为动物密文；大学/城市/歌手等专名下可附 AI 毒舌梗，其余仅密文；粘贴纯密文自动解码；关键词与白名单校名有静态彩蛋；列头「复制」可拷贝密文与本站链接</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>批注 — 选中原文段落中的任意文本，添加批注（类似 Word 批注）</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>导出 — 一键导出为 Word（.docx），批注保留为 Word 原生批注</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>历史记录 — 自动保存，支持本地或云端同步</li>
@@ -1644,7 +1731,10 @@ export default function App() {
                     </ol>
                   </div>
 
-                  <div className="pt-4 border-t border-ink/5">
+                  <div className="pt-4 border-t border-ink/5 space-y-3">
+                    <p className="text-[11px] leading-relaxed text-ink/45 text-center font-sans">
+                      本站展示内容（含翻译、分析与 AKI 梗等）由人工智能生成；仅供参考，不代表本站立场。
+                    </p>
                     <p className="text-[10px] uppercase tracking-widest font-bold text-ink/20 text-center">
                       React + TypeScript + Vite · Tailwind CSS · DeepSeek AI · docx.js
                     </p>

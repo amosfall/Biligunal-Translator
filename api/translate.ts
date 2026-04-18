@@ -1,7 +1,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode.js';
-import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
+import { encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
+import { applyAkiEncodingToPairsAsync } from '../lib/akiTranslatedColumn.js';
+import { fetchAkiMemePairDeepseek } from '../lib/akiMemeDeepseek.js';
 
 const CHUNK_SIZE = 10000;
 
@@ -618,8 +620,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const analysis = normalizeAnalysis(analysisJson?.analysis);
     const translationOut =
       targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations)
-      : targetLang === 'aki' ? applyAkiEncodingToPairs(allTranslations, layout)
-      : allTranslations;
+      : targetLang === 'aki'
+        ? await applyAkiEncodingToPairsAsync(allTranslations, layout, (t) =>
+            fetchAkiMemePairDeepseek(t, DEEPSEEK_API_KEY)
+          )
+        : allTranslations;
     return res.status(200).json({ title, author, translation: translationOut, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';

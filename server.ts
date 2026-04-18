@@ -10,7 +10,9 @@ import JSON5 from 'json5';
 import multer from 'multer';
 import { OfficeParser as officeParser } from 'officeparser';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from './lib/morseEncode.ts';
-import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from './lib/customCipher.ts';
+import { encodeAki, wrapAkiDisplayIfFirst } from './lib/customCipher.ts';
+import { applyAkiEncodingToPairsAsync } from './lib/akiTranslatedColumn.ts';
+import { fetchAkiMemePairDeepseek } from './lib/akiMemeDeepseek.ts';
 import { buildRefineAkiZhPrompt, mergeRefinedParagraphs } from './lib/refineAkiZh.ts';
 
 // ── 翻译结果内存缓存（基于内容哈希，最多缓存 100 条，30 分钟过期） ──
@@ -720,6 +722,29 @@ app.post('/api/extract-text', upload.single('file'), async (req, res) => {
   }
 });
 
+/** AKI 动态梗：根据段落原文生成约 50 字中文梗 + 一句英文 */
+app.post('/api/aki-meme', async (req, res) => {
+  const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
+  const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
+  if (!DEEPSEEK_API_KEY || placeholders.some(p => DEEPSEEK_API_KEY.includes(p))) {
+    return res.status(503).json({
+      error: '请先配置 DeepSeek API Key。在 bilingual-editorial 目录下创建 .env.local，填写：DEEPSEEK_API_KEY=你的密钥'
+    });
+  }
+  try {
+    const { text } = req.body as { text?: string };
+    const pair = await fetchAkiMemePairDeepseek(String(text ?? ''), DEEPSEEK_API_KEY);
+    if (!pair) {
+      return res.status(200).json({ eligible: false, zh: '', en: '' });
+    }
+    return res.json({ eligible: true, zh: pair.zh, en: pair.en });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    console.error(err);
+    return res.status(500).json({ error: msg });
+  }
+});
+
 /** AKI 解码后的中文润色（修正拼音还原误差） */
 app.post('/api/refine-zh', async (req, res) => {
   const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
@@ -822,8 +847,11 @@ app.post('/api/translate', async (req, res) => {
     const analysis = normalizeAnalysis(analysisJson?.analysis);
     const translationOut =
       targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations)
-      : targetLang === 'aki' ? applyAkiEncodingToPairs(allTranslations, layout)
-      : allTranslations;
+      : targetLang === 'aki'
+        ? await applyAkiEncodingToPairsAsync(allTranslations, layout, (t) =>
+            fetchAkiMemePairDeepseek(t, DEEPSEEK_API_KEY)
+          )
+        : allTranslations;
     return res.json({ title, author, translation: translationOut, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
@@ -888,14 +916,17 @@ app.post('/api/translate-stream', async (req, res) => {
 
     // 所有翻译块并行发起，每块完成后立即推送进度
     const chunkPromises = chunks.map((chunk, i) =>
-      callDeepSeekCached(transOnlyPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
+      callDeepSeekCached(transOnlyPrompt(chunk), DEEPSEEK_API_KEY).then(async (chunkJson) => {
         const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunk.length);
         const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, layout) : [];
         if (englishPairsForMorseFallback) englishPairsForMorseFallback[i] = chunkPairs;
         const chunkPairsOut =
           targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs)
-          : targetLang === 'aki' ? applyAkiEncodingToPairs(chunkPairs, layout)
-          : chunkPairs;
+          : targetLang === 'aki'
+            ? await applyAkiEncodingToPairsAsync(chunkPairs, layout, (t) =>
+                fetchAkiMemePairDeepseek(t, DEEPSEEK_API_KEY)
+              )
+            : chunkPairs;
         allTranslations[i] = chunkPairsOut;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);

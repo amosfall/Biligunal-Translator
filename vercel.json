@@ -15,6 +15,10 @@
     "api/refine-zh.ts": {
       "maxDuration": 120,
       "includeFiles": "lib/**"
+    },
+    "api/aki-meme.ts": {
+      "maxDuration": 120,
+      "includeFiles": "lib/**"
     }
   }
 }

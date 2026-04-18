@@ -1,7 +1,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode.js';
-import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
+import { encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
+import { applyAkiEncodingToPairsAsync } from '../lib/akiTranslatedColumn.js';
+import { fetchAkiMemePairDeepseek } from '../lib/akiMemeDeepseek.js';
 
 const CHUNK_SIZE = 10000;
 
@@ -600,14 +602,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 所有翻译块并行发起，每块完成后立即推送进度
     const chunkPromises = chunks.map((chunk, i) =>
-      callDeepSeek(transPrompt(chunk), DEEPSEEK_API_KEY).then((chunkJson) => {
+      callDeepSeek(transPrompt(chunk), DEEPSEEK_API_KEY).then(async (chunkJson) => {
         const chunkRaw = normalizeTranslationToArray(chunkJson?.translation, chunk.length);
         const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, layout) : [];
         if (englishPairsForMorseFallback) englishPairsForMorseFallback[i] = chunkPairs;
         const chunkPairsOut =
           targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs)
-          : targetLang === 'aki' ? applyAkiEncodingToPairs(chunkPairs, layout)
-          : chunkPairs;
+          : targetLang === 'aki'
+            ? await applyAkiEncodingToPairsAsync(chunkPairs, layout, (t) =>
+                fetchAkiMemePairDeepseek(t, DEEPSEEK_API_KEY)
+              )
+            : chunkPairs;
         allTranslations[i] = chunkPairsOut;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);

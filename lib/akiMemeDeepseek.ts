@@ -1,0 +1,93 @@
+import JSON5 from "json5";
+import { buildAkiMemePrompt } from "./akiMemePrompt";
+
+const sanitizeJson = (s: string) => s.replace(/,(\s*[\]}])/g, "$1");
+
+function parseDeepSeekJson(content: string): Record<string, unknown> {
+  try {
+    return JSON.parse(content || "{}");
+  } catch {}
+  try {
+    return JSON.parse(sanitizeJson(content));
+  } catch {}
+  try {
+    return JSON5.parse(content);
+  } catch {}
+  const m = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\{[\s\S]*\}/);
+  const extracted = m ? (m[1] ?? m[0]) : "{}";
+  try {
+    return JSON5.parse(extracted);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 调用 DeepSeek：仅当 eligible 为 true 时返回梗；否则返回 null（调用方仅展示密文）。
+ */
+export async function fetchAkiMemePairDeepseek(
+  text: string,
+  apiKey: string
+): Promise<{ zh: string; en: string } | null> {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const prompt = buildAkiMemePrompt(trimmed);
+
+  let data: unknown;
+  try {
+    const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content:
+              'Valid JSON only: eligible, zh, en. When eligible true: extra mean Chinese roast, often open with 你是一个X人; English may open with You are a... / If you have ever...',
+          },
+          { role: "user", content: prompt },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 1024,
+      }),
+    });
+
+    if (!response.ok) return null;
+    data = await response.json();
+  } catch {
+    return null;
+  }
+
+  const json = parseDeepSeekJson(
+    (data as { choices?: { message?: { content?: string } }[] })?.choices?.[0]?.message?.content ?? ""
+  );
+
+  const eligibleRaw = json.eligible;
+  const eligibleFalse =
+    eligibleRaw === false ||
+    eligibleRaw === "false" ||
+    String(eligibleRaw ?? "").toLowerCase() === "false";
+  if (eligibleFalse) return null;
+
+  const eligibleTrue =
+    eligibleRaw === true ||
+    eligibleRaw === "true" ||
+    String(eligibleRaw ?? "").toLowerCase() === "true";
+
+  const zh = String(json.zh ?? "")
+    .trim()
+    .slice(0, 200);
+  const en = String(json.en ?? "")
+    .trim()
+    .slice(0, 400);
+
+  if (!zh) return null;
+  if (!eligibleTrue) return null;
+
+  return { zh, en };
+}
