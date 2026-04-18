@@ -2,7 +2,7 @@ import { glossNicknameEn } from "./nicknameEnGloss";
 import { USER_NICKNAME_SUPPLEMENT } from "./uniUserNicknameSupplement.generated";
 
 type UniVariation = { zh: string; en: string };
-type UniRow = { match: string; variations: UniVariation[] };
+type UniRow = { match: string; variations: UniVariation[]; matchAliases?: string[] };
 
 function zhKey(v: UniVariation): string {
   return v.zh.trim();
@@ -12,7 +12,7 @@ function zhKey(v: UniVariation): string {
 export function mergeUniversityNicknameSupplement(base: UniRow[]): UniRow[] {
   const byMatch = new Map<string, UniRow>();
   for (const row of base) {
-    byMatch.set(row.match, { match: row.match, variations: [...row.variations] });
+    byMatch.set(row.match, { ...row, variations: [...row.variations] });
   }
 
   for (const [match, zhs] of Object.entries(USER_NICKNAME_SUPPLEMENT)) {

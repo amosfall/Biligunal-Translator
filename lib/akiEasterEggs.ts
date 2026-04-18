@@ -61,6 +61,14 @@ function uniRowMatchEquals(normalizedInput: string, matchKey: string): boolean {
   return false;
 }
 
+/** 中央戏剧学院：校名、专业名、校名+专业（见 uniEasterData.matchAliases）均触发同一彩蛋 */
+function matchesZhongXiEasterInput(normalizedInput: string): boolean {
+  const zxRow = UNIVERSITY_ROWS.find((r) => r.match === "中央戏剧学院");
+  if (!zxRow) return false;
+  const keys = [zxRow.match, ...(zxRow.matchAliases ?? [])];
+  return keys.some((k) => uniRowMatchEquals(normalizedInput, k));
+}
+
 /** 是否与 legacy HKU 彩蛋同键（hku / 香港大学），用于「首次静态、再次走动态梗」 */
 /** 英文爱情触发词：i love you / i love u 等同；已 normalize + toLowerCase */
 function matchesLegacyILoveYouPhrase(lower: string, tNormalized: string): boolean {
@@ -92,11 +100,11 @@ export function isLegacyMeijiInput(raw: string): boolean {
   return uniRowMatchEquals(t, "明治大学");
 }
 
-/** 与中央戏剧学院静态彩蛋同键（整段为「中央戏剧学院」），策略同明治 / HKU */
+/** 与中央戏剧学院静态彩蛋同键（校名 / 专业 / 校名+专业，见 matchAliases），策略同明治 / HKU */
 export function isLegacyZhongXiInput(raw: string): boolean {
   const t = normalizeEasterInput(raw);
   if (!t) return false;
-  return uniRowMatchEquals(t, "中央戏剧学院");
+  return matchesZhongXiEasterInput(t);
 }
 
 export function matchAkiEasterEggSource(
@@ -126,10 +134,10 @@ export function matchAkiEasterEggSource(
     }
   }
 
-  /** 中央戏剧学院：同上 */
+  /** 中央戏剧学院：校名、专业、校名+专业均可触发 */
   if (!options?.skipLegacyZhongXi) {
     const zxRow = UNIVERSITY_ROWS.find((r) => r.match === "中央戏剧学院");
-    if (zxRow && uniRowMatchEquals(t, "中央戏剧学院")) {
+    if (zxRow && matchesZhongXiEasterInput(t)) {
       return { type: "uni", official: zxRow.match, variations: zxRow.variations };
     }
   }

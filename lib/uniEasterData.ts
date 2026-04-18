@@ -6,7 +6,12 @@ import { mergeUniversityNicknameSupplement } from "./mergeUniNicknameSupplement"
 
 export type UniVariation = { zh: string; en: string };
 
-export type UniRow = { match: string; variations: UniVariation[] };
+/** match 为密文编码用的官方名；matchAliases 为等价触发的整段输入（如仅专业、校名+专业） */
+export type UniRow = {
+  match: string;
+  variations: UniVariation[];
+  matchAliases?: string[];
+};
 
 const UNIVERSITY_ROWS_BASE: UniRow[] = [
   // —— 中国（联合校名在前）——
@@ -286,10 +291,17 @@ const UNIVERSITY_ROWS_BASE: UniRow[] = [
   },
   {
     match: "中央戏剧学院",
+    /** 仅专业 / 校名+专业（空格或 +）与无空格连写，均触发同一套彩蛋；密文仍对校名编码 */
+    matchAliases: [
+      "导演系",
+      "中央戏剧学院 + 导演系",
+      "中央戏剧学院 导演系",
+      "中央戏剧学院导演系",
+    ],
     variations: [
       {
-        zh: "Aki的本科学校，真是怀念呀！",
-        en: "The Central Academy of Drama—AKI's undergrad days, good old nostalgia.",
+        zh: "本科在中央戏剧学院读导演系，真是怀念呀！",
+        en: "Directing major at the Central Academy of Drama—AKI's undergrad, sweet nostalgia.",
       },
     ],
   },

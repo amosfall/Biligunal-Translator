@@ -340,58 +340,6 @@ function clerkAdminIdsFromEnv(): Set<string> {
 const STORAGE_MODE_KEY = "bilingual-editorial-storage-mode";
 type StorageMode = "local" | "cloud";
 
-const DEMO_TITLE = { en: "To\nStéphane", zh: "致\n斯蒂芬" };
-const DEMO_AUTHOR = { en: "Eileen Myles", zh: "艾琳·迈尔斯" };
-const DEMO_CONTENT: ParagraphPair[] = [
-  {
-    en: `Dear Stéphane,\nIt's your birthday. You'd be 61, born in '61. I'm thinking of you as the stars fan out in the sky tonight as I walk my dog. It strikes me that the extreme head racket that occupies so much of your work is stellar: "Oy Suzy" there goes one, yet my feeling about the text written alongside one image or the flowers popped in around the jabber is that it is never very much about "one" speaking at all.`,
-    zh: `亲爱的斯蒂芬，\n今天是你的生日。你会61岁，出生于1961年。我在遛狗的时候，抬头看着天上星星点点，想着你。你的作品中充满了那种喧嚣的头脑轰鸣，让我想起星辰的闪烁。\u201C喂，苏西，\u201D一颗星滑落，但我感觉那些伴随图像而写的文字，或插入在喋喋不休中的花朵，从来都不是关于某个\u201C人\u201D在发声。`,
-  },
-  {
-    en: "The words just constellate, burst into symbols whether pictograph men with guns or a multiple territory of women with their names and each with a little sac attached like aphids then a quick sketch of a nightclub recurs, a dirty mouth, a piggy truck, an old banana, a smile a piece of fruit and often it feels like a contagious memory map of one long strewn night. A life.",
-    zh: `那些词语只是像星座一样聚集，爆发成符号\u2014\u2014无论是带枪的象形文字般的小人，还是一片属于许多女人的领地，这些女人每个都有个像蚜虫一样的小袋子，接着又突然出现夜总会的速写、污秽的嘴巴、一辆破卡车、一根发霉的香蕉、一张笑脸或一个水果，常常像是一张漫长的记忆地图，一个人生。`,
-  },
-];
-const DEMO_ANALYSIS: ArticleAnalysis = {
-  summary: {
-    en: "A personal letter exploring how memory, life, and artistic expression intertwine through stargazing and fragments of consciousness.",
-    zh: "这是一封写给斯蒂芬的私人信件，通过对星空与艺术作品的观察，探讨了记忆、生命与表达的本质。",
-  },
-  narrativeDetail: {
-    en: "The narrative employs non-linear stream of consciousness. Starting with the immediate scene of walking a dog, it transitions through the image of stars to an evaluation of Stephane's work. The focus is not on events but on the accumulation of imagery from the extreme head racket to constellation-like words, to visceral visual symbols (armed stick figures, nightclubs, rotting bananas). This mirrors the fragmentary nature of memory, presenting a life as a memory map of a long, scattered night.",
-    zh: `叙事采用了非线性的意识流手法。作者从当下的遛狗场景切入，通过\u201C星星\u201D这一意象自然过渡到对斯蒂芬艺术作品的评价。叙事重心不在于具体的事件，而在于意象的堆叠\u2014\u2014从\u201C喧嚣的头脑\u201D到\u201C星座般的词语\u201D，再到一系列具体的、具有冲击力的视觉符号。这种叙事方式模拟了记忆的碎片化特征，将一个人的生命呈现为一张\u201C漫长且散乱的夜晚\u201D所构成的记忆地图。`,
-  },
-  themes: [
-    { en: "Fragmentation and reconstruction of memory", zh: "记忆的碎片化与重构" },
-    { en: "Depersonalization of artistic expression", zh: "艺术表达的非人格化" },
-    { en: "Life as a spatiotemporal map metaphor", zh: "生命作为时空地图的隐喻" },
-  ],
-  pros: [
-    { en: "Imagery is highly condensed with strong visual resonance", zh: "意象高度浓缩且具有强烈的视觉感" },
-    { en: "Successfully captures the delicate texture of flowing consciousness", zh: "成功捕捉了意识流动的细腻质感" },
-    { en: "Profoundly explores the distance between art and its creator", zh: "深刻探讨了艺术与创作者之间的距离" },
-  ],
-  cons: [
-    { en: "Imagery shifts so rapidly that initial reading may feel disconnected", zh: "意象跳跃极快，初读可能产生断裂感" },
-    { en: "Demands a reader comfortable with abstract metaphor", zh: "对读者理解抽象隐喻的能力要求较高" },
-    { en: "Loose structure lacks conventional narrative tension", zh: "叙事结构松散，缺乏传统意义上的情节起伏" },
-  ],
-  plotSynopsis: {
-    en: "The narrator writes a birthday letter to Stéphane, who would turn 61. While walking the dog under a starlit sky, she reflects on his artistic work — a chaotic, explosive collage of symbols, images, and fragments. She observes that his art is never about a single voice speaking, but rather a constellation of bursting pictographs: armed stick figures, clusters of women with names and tiny sacs like aphids, recurring nightclub sketches, dirty mouths, piggy trucks, old bananas, smiles, and pieces of fruit. Together these fragments form what she describes as a contagious memory map — one long, scattered night that constitutes an entire life. The letter is both an intimate tribute and a critical meditation on how art captures the texture of lived experience through accumulation rather than narrative.",
-    zh: "叙述者在斯蒂芬61岁生日之际写了一封信。她在星空下遛狗时，思绪飘向他的艺术作品——那是一场由符号、图像和碎片组成的混沌而充满爆发力的拼贴。她观察到他的艺术从不关于某个单一的声音在发声，而是一群爆裂的象形文字的聚合：带枪的火柴人、成群结队的女人们（每人都有名字和像蚜虫般附着的小囊）、反复出现的夜总会速写、污秽的嘴巴、小猪卡车、发霉的香蕉、微笑和水果。这些碎片共同构成了她所描述的一张\"传染性的记忆地图\"——一个漫长而散乱的夜晚，构成了一整个人生。这封信既是一份私密的致敬，也是对艺术如何通过积累而非叙事来捕捉生活经验质感的深刻思考。",
-  },
-  characters: [
-    {
-      name: { en: "The Narrator (Eileen Myles)", zh: "叙述者（艾琳·迈尔斯）" },
-      description: { en: "A poet and writer composing a birthday letter while walking her dog at night. She serves as both an intimate friend and a perceptive critic of Stéphane's art.", zh: "一位诗人兼作家，在夜间遛狗时写下这封生日信。她既是斯蒂芬的亲密朋友，也是他艺术作品的敏锐评论者。" },
-    },
-    {
-      name: { en: "Stéphane", zh: "斯蒂芬" },
-      description: { en: "The letter's recipient, turning 61. An artist whose work is characterized by chaotic, explosive collages of symbols and fragmented imagery — described as producing 'extreme head racket' that constellates into memory maps.", zh: "信件的收信人，即将61岁。一位艺术家，其作品以混沌而具有爆发力的符号拼贴和碎片化意象为特征——被描述为产生\"极端的头脑喧嚣\"，最终汇聚成记忆的星图。" },
-    },
-  ],
-};
-
 export default function App() {
   const auth = useAppAuth();
   const [loginInput, setLoginInput] = useState("");
@@ -406,14 +354,14 @@ export default function App() {
   const isLoggedIn = auth.isLoaded && !!auth.userId;
   const localUserBoot = readLocalUsernameBoot();
 
-  /** 当前正文左栏实际语种（与本次 en/zh 数据一致）；栏目标题用此值，避免仅依赖 localStorage 的 sourceLang 与正文错位（如 Demo 英文左栏却显示「繁體中文」） */
+  /** 当前正文左栏实际语种（与本次 en/zh 数据一致）；栏目标题用此值，避免仅依赖 localStorage 的 sourceLang 与正文错位（如英文左栏却显示「繁體中文」） */
   const [contentPairSourceLang, setContentPairSourceLang] = useState<SourceLang | null>(() =>
     readLocalUsernameBoot() ? null : "en"
   );
   /** 左栏为 AKI 密文、右栏为解码中文（与「译成 AKI」时左原文右密文区分） */
   const akiDecodeLayout = contentPairSourceLang === "aki" && contentPairTargetLang === "zh";
 
-  /** 默认空文档，便于首页中央粘贴区展示；示例书信由「载入示例」触发，避免永远占满正文 */
+  /** 默认空文档，便于首页中央粘贴区展示 */
   const [content, setContent] = useState<ParagraphPair[]>(() => []);
   const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(null);
   const [title, setTitle] = useState(() => ({ zh: "", en: "" }));
@@ -1547,21 +1495,6 @@ export default function App() {
     }
   };
 
-  const loadDemoDocument = useCallback(() => {
-    setError(null);
-    setOriginalDocx(null);
-    setContent(DEMO_CONTENT);
-    setAnalysis(DEMO_ANALYSIS);
-    setTitle(DEMO_TITLE);
-    setAuthor(DEMO_AUTHOR);
-    setAnnotations([]);
-    setActiveAnnotationId(null);
-    setPendingSelection(null);
-    setContentPairSourceLang("en");
-    setContentPairTargetLang(readStoredTargetLang());
-    setSourceLang("en");
-  }, []);
-
   if (auth.mode === "clerk" && !auth.isLoaded) {
     return (
       <div className="min-h-screen bg-paper flex items-center justify-center font-sans text-sm text-ink/40">
@@ -1797,7 +1730,7 @@ export default function App() {
                 <textarea
                   value={textInput}
                   onChange={(e) => setTextInput(e.target.value)}
-                  placeholder="粘贴或输入需要翻译的文本..."
+                  placeholder="输入学校 / 城市 / 专业 / 电影 / 歌手以触发彩蛋，或粘贴全文翻译…"
                   className="w-full min-h-[160px] bg-transparent resize-y outline-none font-serif text-sm leading-relaxed text-ink/80 placeholder:text-ink/20"
                   autoFocus
                 />
@@ -2284,7 +2217,7 @@ export default function App() {
           <div className="max-w-3xl mx-auto py-10 sm:py-16 md:py-24">
             <div className="border border-ink/10 rounded-3xl sm:rounded-[2.5rem] bg-white/50 backdrop-blur-md p-5 sm:p-8 md:p-12 shadow-sm">
               <label htmlFor="empty-state-import" className="sr-only">
-                粘贴或输入要翻译的文本
+                翻译输入：可粘贴全文，或输入学校、城市、专业、电影、歌手等触发彩蛋
               </label>
               <textarea
                 id="empty-state-import"
@@ -2296,9 +2229,9 @@ export default function App() {
                     if (textInput.trim()) void handleTextSubmit();
                   }
                 }}
-                placeholder="在此粘贴或输入要翻译的文本…"
+                placeholder="输入学校 / 城市 / 专业 / 电影 / 歌手以触发彩蛋，或粘贴全文翻译…"
                 className="w-full min-h-[220px] md:min-h-[260px] bg-transparent resize-y outline-none font-serif text-base leading-relaxed text-ink/85 placeholder:text-ink/25 focus:ring-0"
-                aria-label="粘贴或输入要翻译的文本"
+                aria-label="翻译输入：可粘贴全文，或输入学校、城市、专业、电影、歌手等触发彩蛋"
               />
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mt-8 pt-8 border-t border-ink/10">
                 <p className="text-[11px] font-sans text-ink/40 order-2 sm:order-1 leading-relaxed">
@@ -2323,13 +2256,6 @@ export default function App() {
               <p className="mt-4 text-[10px] font-sans text-ink/30 text-center sm:text-left">
                 快捷键：⌘ / Ctrl + Enter 开始翻译
               </p>
-              <button
-                type="button"
-                onClick={loadDemoDocument}
-                className="mt-5 w-full text-center text-[11px] font-sans text-ink/45 hover:text-vibrant-1 transition-colors underline-offset-4 hover:underline"
-              >
-                载入示例书信（艾琳·迈尔斯）
-              </button>
             </div>
           </div>
         )}
