@@ -1,5 +1,5 @@
 import JSON5 from "json5";
-import { buildAkiMemePrompt } from "./akiMemePrompt";
+import { buildAkiMemePrompt } from "./akiMemePrompt.js";
 
 const sanitizeJson = (s: string) => s.replace(/,(\s*[\]}])/g, "$1");
 

@@ -6,7 +6,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback, ChangeEvent } from "react";
 import { isLegacyHkuInput } from "../lib/akiEasterEggs";
 import { motion, AnimatePresence } from "motion/react";
-import { BookOpen, Menu, Upload, Loader2, FileText, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle, Search, ChevronUp } from "lucide-react";
+import { BookOpen, Menu, Upload, Loader2, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle, Search, ChevronUp } from "lucide-react";
 import mammoth from "mammoth";
 import JSON5 from "json5";
 import FloatingTextFollowup from "./FloatingTextFollowup";
@@ -70,6 +70,11 @@ const TARGET_LANG_LABELS: Record<TargetLang, string> = {
 };
 const TARGET_LANG_KEY = "bilingual-editorial-target-lang";
 const ALL_TARGET_LANGS: TargetLang[] = ["zh", "zh-TW", "en", "ja", "fr", "de", "ar", "morse", "aki"];
+
+function getAkiMemeApiUrl(): string {
+  const u = import.meta.env.VITE_AKI_MEME_API?.trim();
+  return u && u.length > 0 ? u : "/api/aki-meme";
+}
 /** 未保存过目标语时：游客默认「译成 AKI 码」；登录用户见下方 useLayoutEffect 回落为简体中文 */
 function readStoredTargetLang(): TargetLang {
   try {
@@ -332,10 +337,11 @@ export default function App() {
   /** 左栏为 AKI 密文、右栏为解码中文（与「译成 AKI」时左原文右密文区分） */
   const akiDecodeLayout = contentPairSourceLang === "aki" && contentPairTargetLang === "zh";
 
-  const [content, setContent] = useState<ParagraphPair[]>(() => (localUserBoot ? [] : DEMO_CONTENT));
-  const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => (localUserBoot ? null : DEMO_ANALYSIS));
-  const [title, setTitle] = useState(() => (localUserBoot ? { zh: "", en: "" } : DEMO_TITLE));
-  const [author, setAuthor] = useState(() => (localUserBoot ? { zh: "", en: "" } : DEMO_AUTHOR));
+  /** 默认空文档，便于首页中央粘贴区展示；示例书信由「载入示例」触发，避免永远占满正文 */
+  const [content, setContent] = useState<ParagraphPair[]>(() => []);
+  const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(null);
+  const [title, setTitle] = useState(() => ({ zh: "", en: "" }));
+  const [author, setAuthor] = useState(() => ({ zh: "", en: "" }));
   const [isTranslating, setIsTranslating] = useState(false);
   const [progress, setProgress] = useState<{ percent: number; step: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -447,10 +453,10 @@ export default function App() {
       setContentPairSourceLang(null);
       setHistory((h) => h.map((item) => (item.username ? item : { ...item, username: cur })));
     } else {
-      setContent(DEMO_CONTENT);
-      setAnalysis(DEMO_ANALYSIS);
-      setTitle(DEMO_TITLE);
-      setAuthor(DEMO_AUTHOR);
+      setContent([]);
+      setAnalysis(null);
+      setTitle({ zh: "", en: "" });
+      setAuthor({ zh: "", en: "" });
       setAnnotations([]);
       setContentPairTargetLang(readStoredTargetLang());
       setContentPairSourceLang("en");
@@ -1029,24 +1035,75 @@ export default function App() {
 
     setContent([]);
 
-    // AKI码 快捷路径：任何语言→AKI 直接前端编码，不走翻译 API（动态梗走 /api/aki-meme）
+    // AKI码 快捷路径：任何语言→AKI 直接前端编码，不走翻译 API（动态梗走 /api/aki-meme 或 VITE_AKI_MEME_API）
     if (usedTargetLang === "aki") {
       setProgress({ percent: 40, step: "正在翻译..." });
+      const memeUrl = getAkiMemeApiUrl();
+      let memeApiErrorReported = false;
       const fetchMeme = async (text: string) => {
         try {
-          const r = await fetch("/api/aki-meme", {
+          const r = await fetch(memeUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text }),
           });
-          if (!r.ok) return null;
-          const j = (await r.json()) as { eligible?: boolean; zh?: string; en?: string };
+          if (!r.ok) {
+            if (!memeApiErrorReported) {
+              memeApiErrorReported = true;
+              let serverMsg = "";
+              try {
+                const errJson = (await r.json()) as { error?: string };
+                serverMsg = typeof errJson.error === "string" ? errJson.error : "";
+              } catch {
+                /* 可能返回了 HTML 404 页面 */
+              }
+              if (r.status === 503) {
+                setError(
+                  serverMsg ||
+                    "AKI 动态梗未启用：请在部署环境（如 Vercel）配置 DEEPSEEK_API_KEY，并确保可访问「动态梗」接口。"
+                );
+              } else if (r.status === 404) {
+                setError(
+                  "找不到动态梗接口。若前端托管在纯静态站，请在构建环境变量中设置 VITE_AKI_MEME_API 为含 /api/aki-meme 的完整后端地址。"
+                );
+              } else {
+                setError(serverMsg || `动态梗服务不可用（HTTP ${r.status}）。仅显示密文。`);
+              }
+            }
+            return null;
+          }
+          const ct = r.headers.get("content-type") ?? "";
+          if (!ct.includes("json")) {
+            if (!memeApiErrorReported) {
+              memeApiErrorReported = true;
+              setError(
+                "动态梗接口返回的不是 JSON（多为静态站把 /api 指到了网页，实际没有后端）。请用含 api/ 的 Vercel 全栈部署，或设置 VITE_AKI_MEME_API。"
+              );
+            }
+            return null;
+          }
+          let j: { eligible?: boolean; zh?: string; en?: string };
+          try {
+            j = (await r.json()) as { eligible?: boolean; zh?: string; en?: string };
+          } catch {
+            if (!memeApiErrorReported) {
+              memeApiErrorReported = true;
+              setError("动态梗接口响应无法解析为 JSON（可能被替换成了 HTML）。");
+            }
+            return null;
+          }
           if (j.eligible === false) return null;
           const zh = String(j.zh ?? "").trim();
           const en = String(j.en ?? "").trim();
           if (!zh) return null;
           return { zh, en };
         } catch {
+          if (!memeApiErrorReported) {
+            memeApiErrorReported = true;
+            setError(
+              `无法连接动态梗服务（${memeUrl}）。请检查网络、CORS，或配置 VITE_AKI_MEME_API 指向正确的 API 域名。`
+            );
+          }
           return null;
         }
       };
@@ -1396,6 +1453,21 @@ export default function App() {
       setProgress(null);
     }
   };
+
+  const loadDemoDocument = useCallback(() => {
+    setError(null);
+    setOriginalDocx(null);
+    setContent(DEMO_CONTENT);
+    setAnalysis(DEMO_ANALYSIS);
+    setTitle(DEMO_TITLE);
+    setAuthor(DEMO_AUTHOR);
+    setAnnotations([]);
+    setActiveAnnotationId(null);
+    setPendingSelection(null);
+    setContentPairSourceLang("en");
+    setContentPairTargetLang(readStoredTargetLang());
+    setSourceLang("en");
+  }, []);
 
   if (auth.mode === "clerk" && !auth.isLoaded) {
     return (
@@ -2111,15 +2183,58 @@ export default function App() {
           </>
         )}
 
-        {/* Empty State */}
+        {/* Empty State：中央直接粘贴，等价于 Import */}
         {!isTranslating && content.length === 0 && (
-          <div className="text-center py-32 border border-ink/5 rounded-[4rem] bg-white/10 backdrop-blur-sm">
-            <div className="w-24 h-24 mx-auto mb-8 rounded-full bg-ink/5 flex items-center justify-center">
-              <FileText className="w-8 h-8 opacity-10" />
+          <div className="max-w-3xl mx-auto py-16 md:py-24">
+            <div className="border border-ink/10 rounded-[2.5rem] bg-white/50 backdrop-blur-md p-8 md:p-12 shadow-sm">
+              <label htmlFor="empty-state-import" className="sr-only">
+                粘贴或输入要翻译的文本
+              </label>
+              <textarea
+                id="empty-state-import"
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    if (textInput.trim()) void handleTextSubmit();
+                  }
+                }}
+                placeholder="在此粘贴或输入要翻译的文本…"
+                className="w-full min-h-[220px] md:min-h-[260px] bg-transparent resize-y outline-none font-serif text-base leading-relaxed text-ink/85 placeholder:text-ink/25 focus:ring-0"
+                aria-label="粘贴或输入要翻译的文本"
+              />
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mt-8 pt-8 border-t border-ink/10">
+                <p className="text-[11px] font-sans text-ink/40 order-2 sm:order-1 leading-relaxed">
+                  与左上角 <span className="font-semibold text-ink/55">Import</span> 共用输入；也可{" "}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="text-vibrant-1 hover:underline underline-offset-2 font-medium"
+                  >
+                    上传 Word / PDF
+                  </button>
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void handleTextSubmit()}
+                  disabled={!textInput.trim()}
+                  className="order-1 sm:order-2 px-8 py-3.5 bg-ink text-paper text-xs font-sans font-bold uppercase tracking-widest rounded-2xl hover:bg-vibrant-1 transition-colors disabled:opacity-20 shrink-0"
+                >
+                  翻译
+                </button>
+              </div>
+              <p className="mt-4 text-[10px] font-sans text-ink/30 text-center sm:text-left">
+                快捷键：⌘ / Ctrl + Enter 开始翻译
+              </p>
+              <button
+                type="button"
+                onClick={loadDemoDocument}
+                className="mt-5 w-full text-center text-[11px] font-sans text-ink/45 hover:text-vibrant-1 transition-colors underline-offset-4 hover:underline"
+              >
+                载入示例书信（艾琳·迈尔斯）
+              </button>
             </div>
-            <p className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-20">
-              点击左上角 Import 输入文本或上传文件
-            </p>
           </div>
         )}
 
