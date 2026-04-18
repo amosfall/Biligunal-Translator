@@ -10,6 +10,21 @@ import mammoth from "mammoth";
 import JSON5 from "json5";
 import FloatingTextFollowup from "./FloatingTextFollowup";
 import { useAppAuth } from "./auth/AppAuthContext";
+import {
+  decodeAki,
+  encodeSourceParagraphToAkiColumn,
+  AKI_SITE_URL,
+  extractAkiCipherFromTranslatedParagraph,
+  isProbablyAkiCipher,
+  prepareAkiImportText,
+} from "../lib/customCipher";
+import { mergeRefinedParagraphs, shouldRefineDecodedAkiText } from "../lib/refineAkiZh";
+import { stripUrlsForTranslation } from "../lib/stripUrlsForTranslation";
+import {
+  GUEST_TRANSLATION_LIMIT_MESSAGE,
+  incrementGuestTranslationSuccessIfVisitor,
+  isGuestTranslationQuotaExceeded,
+} from "../lib/guestTranslationLimit";
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -27,7 +42,7 @@ async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<string> {
   return pages.join("\n\n");
 }
 
-type SourceLang = "en" | "fr" | "ja" | "de" | "ar" | "zh-TW" | "zh";
+type SourceLang = "en" | "fr" | "ja" | "de" | "ar" | "zh-TW" | "zh" | "aki";
 const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
   en: "English",
   fr: "Français",
@@ -36,8 +51,10 @@ const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
   ja: "日本語",
   "zh-TW": "繁體中文",
   zh: "简体中文",
+  /** 仅 AKI 密文→中文解码结果页左栏展示，不出现在用户手选原文语种里 */
+  aki: "AKI码",
 };
-type TargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse";
+type TargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse" | "aki";
 const TARGET_LANG_LABELS: Record<TargetLang, string> = {
   zh: "简体中文",
   "zh-TW": "繁體中文",
@@ -47,9 +64,10 @@ const TARGET_LANG_LABELS: Record<TargetLang, string> = {
   de: "Deutsch",
   ar: "العربية",
   morse: "摩斯密码",
+  aki: "AKI码",
 };
 const TARGET_LANG_KEY = "bilingual-editorial-target-lang";
-const ALL_TARGET_LANGS: TargetLang[] = ["zh", "zh-TW", "en", "ja", "fr", "de", "ar", "morse"];
+const ALL_TARGET_LANGS: TargetLang[] = ["zh", "zh-TW", "en", "ja", "fr", "de", "ar", "morse", "aki"];
 function readStoredTargetLang(): TargetLang {
   try {
     const t = localStorage.getItem(TARGET_LANG_KEY);
@@ -60,6 +78,7 @@ function readStoredTargetLang(): TargetLang {
   return "zh";
 }
 const SOURCE_LANG_KEY = "bilingual-editorial-source-lang";
+/** 用户可选 / 历史记录中的原文语种（不含仅用于栏目标题的 aki） */
 const ALL_SOURCE_LANGS: SourceLang[] = ["en", "fr", "de", "ar", "ja", "zh-TW", "zh"];
 function readStoredSourceLang(): SourceLang {
   try {
@@ -91,6 +110,7 @@ function detectSourceLang(text: string): SourceLang {
   if (fr / Math.max(total, 1) > 0.008) return "fr";
   return "en";
 }
+
 const LOCAL_USERNAME_STORAGE = "bilingual-editorial-username";
 
 function readLocalUsernameBoot(): string | null {
@@ -306,6 +326,8 @@ export default function App() {
   const [contentPairSourceLang, setContentPairSourceLang] = useState<SourceLang | null>(() =>
     readLocalUsernameBoot() ? null : "en"
   );
+  /** 左栏为 AKI 密文、右栏为解码中文（与「译成 AKI」时左原文右密文区分） */
+  const akiDecodeLayout = contentPairSourceLang === "aki" && contentPairTargetLang === "zh";
 
   const [content, setContent] = useState<ParagraphPair[]>(() => (localUserBoot ? [] : DEMO_CONTENT));
   const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => (localUserBoot ? null : DEMO_ANALYSIS));
@@ -470,6 +492,52 @@ export default function App() {
     setCurrentMatchIndex(0);
   }, []);
 
+  /** AKI 译文栏复制：在选中文本后附加本站地址，便于接收方打开解码 */
+  const handleAkiTranslatedCopy = useCallback(
+    (e: React.ClipboardEvent<HTMLDivElement>) => {
+      if (contentPairTargetLang !== "aki") return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      const node = sel.anchorNode ?? sel.focusNode;
+      if (!node) return;
+      const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element);
+      if (!el || !el.closest("[data-aki-translated]")) return;
+      const text = sel.toString();
+      if (!text.trim()) return;
+      e.preventDefault();
+      e.clipboardData.setData("text/plain", `${text.trim()}\n${AKI_SITE_URL}`);
+    },
+    [contentPairTargetLang]
+  );
+
+  /** 列头「复制」：各段 AKI 密文（不含彩蛋说明行）+ 换行 + 本站地址，与划选复制一致 */
+  const copyFullAkiColumn = useCallback(async () => {
+    if (contentPairTargetLang !== "aki" || content.length === 0) return;
+    const text = content
+      .map((p) => extractAkiCipherFromTranslatedParagraph(getTranslatedColumnText(p, contentPairTargetLang)))
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+    if (!text) return;
+    const out = `${text}\n${AKI_SITE_URL}`;
+    try {
+      await navigator.clipboard.writeText(out);
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = out;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [content, contentPairTargetLang]);
+
   // Keyboard shortcut: Cmd/Ctrl+F
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -630,13 +698,21 @@ export default function App() {
     setAnalysis(normalizeAnalysis(item.analysis) ?? item.analysis ?? null);
     setTitle(item.title);
     setAuthor(item.author);
-    if (item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang)) setSourceLang(item.sourceLang);
-    const t = item.targetLang && ALL_TARGET_LANGS.includes(item.targetLang) ? item.targetLang : "zh";
-    setTargetLang(t);
-    setContentPairTargetLang(t);
-    setContentPairSourceLang(
-      item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang) ? item.sourceLang : "en"
-    );
+    const isAkiDecodeRecord = item.title?.en === "AKI码 解码";
+    if (isAkiDecodeRecord) {
+      setSourceLang("en");
+      setTargetLang("zh");
+      setContentPairTargetLang("zh");
+      setContentPairSourceLang("aki");
+    } else {
+      if (item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang)) setSourceLang(item.sourceLang);
+      const t = item.targetLang && ALL_TARGET_LANGS.includes(item.targetLang) ? item.targetLang : "zh";
+      setTargetLang(t);
+      setContentPairTargetLang(t);
+      setContentPairSourceLang(
+        item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang) ? item.sourceLang : "en"
+      );
+    }
     setAnnotations(item.annotations ?? []);
     setCurrentHistoryId(item.id);
     setActiveAnnotationId(null);
@@ -921,6 +997,39 @@ export default function App() {
 
     setContent([]);
 
+    // AKI码 快捷路径：任何语言→AKI 直接前端编码，不走 API
+    if (usedTargetLang === "aki") {
+      setProgress({ percent: 50, step: "正在编码为 AKI码..." });
+      const translation = paragraphs.map((p, idx) => ({
+        en: p,
+        zh: encodeSourceParagraphToAkiColumn(p, idx),
+      }));
+      const result: TranslateResult = {
+        title: { en: "—", zh: "—" },
+        author: { en: "—", zh: "—" },
+        translation,
+        analysis: null,
+      };
+      setProgress({ percent: 95, step: "正在保存..." });
+      const newTitle = { zh: "—", en: "—" };
+      const newAuthor = { zh: "—", en: "—" };
+      setContent(result.translation);
+      setAnalysis(null);
+      setTitle(newTitle);
+      setAuthor(newAuthor);
+      setAnnotations([]);
+      setActiveAnnotationId(null);
+      setPendingSelection(null);
+      saveToHistory(
+        { title: newTitle, author: newAuthor, content: result.translation, analysis: null, annotations: [] },
+        { sourceLang: apiSourceLang, targetLang: usedTargetLang }
+      );
+      setContentPairSourceLang(apiSourceLang);
+      setContentPairTargetLang(usedTargetLang);
+      setProgress({ percent: 100, step: "完成" });
+      return;
+    }
+
     let result: TranslateResult;
     try {
       result = await translateAndAnalyzeStream(
@@ -987,6 +1096,19 @@ export default function App() {
       return;
     }
 
+    const loggedInRt = Boolean(auth.userId);
+    if (isGuestTranslationQuotaExceeded(loggedInRt)) {
+      setError(GUEST_TRANSLATION_LIMIT_MESSAGE);
+      if (auth.mode === "clerk") auth.login();
+      setTargetLang(contentPairTargetLang);
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, contentPairTargetLang);
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     setIsTranslating(true);
     setError(null);
     setAnalysis(null);
@@ -994,6 +1116,7 @@ export default function App() {
 
     try {
       await runTranslationCore(paragraphs, sourceLang, nextTarget);
+      incrementGuestTranslationSuccessIfVisitor(loggedInRt);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg || "重新翻译失败");
@@ -1024,11 +1147,86 @@ export default function App() {
 
   // Shared: parse text into paragraphs and run translation（新稿：自动识别原文语言）
   const runTranslation = async (text: string) => {
+    const textForJob = stripUrlsForTranslation(text);
+    if (!textForJob.trim()) {
+      throw new Error("文档内容为空");
+    }
+
+    const loggedIn = Boolean(auth.userId);
+    if (isGuestTranslationQuotaExceeded(loggedIn)) {
+      setError(GUEST_TRANSLATION_LIMIT_MESSAGE);
+      if (auth.mode === "clerk") auth.login();
+      throw new Error(GUEST_TRANSLATION_LIMIT_MESSAGE);
+    }
+
     const usedTargetLang = targetLang;
     setProgress({ percent: 15, step: "正在提取段落..." });
-    let paragraphs = text.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+
+    // AKI码 解码快捷路径：检测到 AKI码 输入时，直接前端解码，不走 API
+    if (isProbablyAkiCipher(textForJob)) {
+      const akiImport = prepareAkiImportText(textForJob);
+      let paragraphs = akiImport.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+      if (paragraphs.length <= 1) {
+        const byLines = akiImport.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
+        if (byLines.length > paragraphs.length) paragraphs = byLines;
+      }
+      if (paragraphs.length === 0) throw new Error("文档内容为空");
+
+      setProgress({ percent: 50, step: "正在解码 AKI码..." });
+      const roughZh = paragraphs.map((p) => decodeAki(p) || "—");
+      let zhList = roughZh;
+      if (roughZh.some(shouldRefineDecodedAkiText)) {
+        setProgress({ percent: 62, step: "正在用模型修正中文…" });
+        try {
+          const res = await fetch("/api/refine-zh", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paragraphs: roughZh }),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as { paragraphs?: unknown };
+            if (Array.isArray(data.paragraphs)) {
+              zhList = mergeRefinedParagraphs(roughZh, data.paragraphs);
+            }
+          }
+        } catch {
+          /* 离线或未配置 API：保留本地拼音还原结果 */
+        }
+      }
+      const translation = paragraphs.map((p, i) => ({
+        en: p,
+        zh: zhList[i] ?? "—",
+      }));
+      const newTitle = { zh: "—", en: "AKI码 解码" };
+      const newAuthor = { zh: "—", en: "—" };
+      setContent(translation);
+      setAnalysis(null);
+      setTitle(newTitle);
+      setAuthor(newAuthor);
+      setAnnotations([]);
+      setActiveAnnotationId(null);
+      setPendingSelection(null);
+      setContentPairSourceLang("aki");
+      setContentPairTargetLang("zh");
+      setSourceLang("en");
+      setTargetLang("zh");
+      try {
+        localStorage.setItem(TARGET_LANG_KEY, "zh");
+      } catch {
+        /* ignore */
+      }
+      saveToHistory(
+        { title: newTitle, author: newAuthor, content: translation, analysis: null, annotations: [] },
+        { sourceLang: "en", targetLang: "zh" }
+      );
+      setProgress({ percent: 100, step: "完成" });
+      incrementGuestTranslationSuccessIfVisitor(loggedIn);
+      return;
+    }
+
+    let paragraphs = textForJob.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
     if (paragraphs.length <= 1 || paragraphs.some(p => p.length > 5000)) {
-      const byLines = text.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
+      const byLines = textForJob.split(/\n/).map(p => p.trim()).filter(p => p.length > 0);
       if (byLines.length > paragraphs.length) paragraphs = byLines;
     }
 
@@ -1036,12 +1234,13 @@ export default function App() {
       throw new Error("文档内容为空");
     }
 
-    const detected = detectSourceLang(text);
+    const detected = detectSourceLang(textForJob);
     changeSourceLang(detected);
     const apiSourceLang = detected;
 
     setProgress({ percent: 18, step: "正在翻译..." });
     await runTranslationCore(paragraphs, apiSourceLang, usedTargetLang);
+    incrementGuestTranslationSuccessIfVisitor(loggedIn);
   };
 
   const handleFileUpload = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1393,8 +1592,9 @@ export default function App() {
               <div className="pointer-events-auto w-full max-w-lg max-h-[80vh] overflow-y-auto bg-white/95 backdrop-blur-2xl border border-ink/10 rounded-[2.5rem] shadow-2xl p-10">
                 <div className="flex justify-between items-start mb-8">
                   <div>
-                    <h2 className="font-serif text-2xl font-bold text-ink">The Bilingual Review</h2>
-                    <p className="font-sans text-xs text-ink/40 mt-1 uppercase tracking-widest">双语文学编辑平台</p>
+                    <h2 className="font-serif text-2xl font-bold text-ink">Aki 的翻译器</h2>
+                    <p className="font-sans text-xs text-ink/50 mt-1 tracking-wide">Aki&apos;s Translator</p>
+                    <p className="font-sans text-[11px] text-ink/35 mt-2 uppercase tracking-[0.2em]">AKI 动物密文</p>
                   </div>
                   <button onClick={() => setHelpOpen(false)} className="p-2 -m-2 rounded-full hover:bg-ink/5">
                     <X className="w-5 h-5 text-ink/40" />
@@ -1404,33 +1604,43 @@ export default function App() {
                 <div className="space-y-6 text-sm font-sans text-ink/70 leading-relaxed">
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">用途</h3>
-                    <p>一个面向文学文本的双语翻译与分析工具。上传或粘贴文档，在顶栏选择译文语言（默认简体中文），并生成结构化的文学分析，包括剧情梗概、人物介绍、写作优缺点等。</p>
+                    <p className="text-ink/85 font-medium mb-2">试试彩蛋吧！</p>
+                    <p>
+                      面向文学文本的<strong>双语翻译与结构化分析</strong>：上传或粘贴文档，在顶栏「译成」选择目标语言（默认简体中文），生成双语对照与文学分析，包括剧情梗概、人物介绍、写作优缺点等。
+                      另可将正文译为<strong>本站专属的 AKI 动物密文</strong>（字母与拼音对应小动物 emoji），或<strong>直接粘贴密文</strong>，由站内规则一键解码回中文。
+                    </p>
                   </div>
 
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">支持语言</h3>
-                    <p>英文、法文、日文、繁体中文 → 简体中文（自动识别源语言）</p>
+                    <p>
+                      源语言由正文自动识别，无需手选。常见源文：英文、法文、德文、阿拉伯文、日文、繁体中文等。
+                      目标语可选：简体中文、繁体中文、English、日本語、法语、德语、阿拉伯语；亦可译为<strong>摩斯密码</strong>或<strong> AKI 码</strong>。
+                    </p>
                   </div>
 
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">核心功能</h3>
                     <ul className="space-y-2">
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 顶栏「译成」选择目标语言；原文语种由正文自动识别，无需手选</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>文学分析 — 自动生成双语摘要、叙事分析、核心主题、剧情梗概、人物介绍、写作优缺点</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>批注 — 选中原文段落中的任意文本，添加批注（类似 Word 批注功能）</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>导出 — 一键导出为 Word 文档（.docx），批注保留为 Word 原生批注</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>历史记录 — 自动保存翻译记录，支持本地存储或云端同步</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 顶栏「译成」选择目标语言；原文语种由正文自动识别</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>文学分析 — 目标为自然语言时，自动生成双语摘要、叙事分析、核心主题、剧情梗概、人物介绍、写作优缺点</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>AKI 码 — 编码为动物密文；粘贴纯密文自动解码；彩蛋关键词与部分校名有隐藏梗；列头「复制」可拷贝密文与本站链接</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>批注 — 选中原文段落中的任意文本，添加批注（类似 Word 批注）</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>导出 — 一键导出为 Word（.docx），批注保留为 Word 原生批注</li>
+                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>历史记录 — 自动保存，支持本地或云端同步</li>
                     </ul>
                   </div>
 
                   <div>
                     <h3 className="font-bold text-ink/90 text-xs uppercase tracking-widest mb-2">使用方式</h3>
                     <ol className="space-y-1.5 list-decimal list-inside">
-                      <li>点击左上角 <strong>Import</strong> 按钮，粘贴文本或上传文件</li>
-                      <li>系统自动识别语言并翻译，生成双语对照和文学分析</li>
+                      <li>点击左上角 <strong>Import</strong>，粘贴文本或上传 .pdf / .docx / .doc</li>
+                      <li>顶栏「译成」选择目标语言；需要密文时选 <strong>AKI 码</strong> 或 <strong>摩斯密码</strong></li>
+                      <li>若剪贴板里是 AKI 密文，直接粘贴并翻译，将走<strong>解码为中文</strong>（自动忽略文末网址等干扰行）</li>
+                      <li>系统自动识别源语言并处理；自然语言目标下生成双语对照与文学分析</li>
                       <li>在原文中选中文字即可添加批注</li>
-                      <li>点击右上角下载图标导出为 Word 文档</li>
-                      <li>登录后可管理个人翻译历史（配置 Clerk 时使用账号密码；未配置时可用本地用户名）</li>
+                      <li>点击右上角下载图标导出为 Word</li>
+                      <li>登录后可管理个人历史（配置 Clerk 时账号登录；未配置时可用本地用户名）</li>
                     </ol>
                   </div>
 
@@ -1562,7 +1772,11 @@ export default function App() {
                 <h2 className={`${contentPairTargetLang === "en" ? "book-title-zh" : "book-title-en"} whitespace-pre-line`}>{contentPairTargetLang === "en" ? title.zh : title.en}</h2>
                 <p className={`text-xl opacity-60 ${contentPairTargetLang === "en" ? "font-serif-zh tracking-widest" : "font-serif italic"}`}>{contentPairTargetLang === "en" ? author.zh : author.en}</p>
               </div>
-              <div className="space-y-6">
+              <div
+                className="space-y-6"
+                data-aki-translated={contentPairTargetLang === "aki" ? "1" : undefined}
+                onCopy={handleAkiTranslatedCopy}
+              >
                 <h2 className={`${contentPairTargetLang === "en" ? "book-title-en" : "book-title-zh"} whitespace-pre-line`}>{contentPairTargetLang === "en" ? title.en : title.zh}</h2>
                 <p className={`text-xl opacity-60 ${contentPairTargetLang === "en" ? "font-serif italic" : "font-serif-zh tracking-widest"}`}>{contentPairTargetLang === "en" ? author.en : author.zh}</p>
               </div>
@@ -1614,16 +1828,36 @@ export default function App() {
         {(content.length > 0 || !isTranslating) && (
           <>
             {content.length > 0 && (
+            <>
+            <div className="w-full py-12 border-y border-ink/5 mb-10" aria-label="广告位">
+              <h2 className="font-serif text-sm md:text-base font-light tracking-tight text-ink/80 break-words">
+                广告位招租，自定义你的专属密码。akicodehk@gmail.com
+              </h2>
+            </div>
+
             <article className="space-y-16">
               {/* Column labels */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 mb-2">
                 <div>
                   <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">
-                    {SOURCE_LANG_LABELS[contentPairSourceLang ?? sourceLang] || "Source"}
+                    {akiDecodeLayout ? "AKI码" : SOURCE_LANG_LABELS[contentPairSourceLang ?? sourceLang] || "Source"}
                   </span>
                 </div>
-                <div>
-                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">{TARGET_LANG_LABELS[contentPairTargetLang]}</span>
+                <div className="flex items-center justify-between gap-3 min-h-[1.25rem]">
+                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30 shrink-0">
+                    {akiDecodeLayout ? "简体中文" : TARGET_LANG_LABELS[contentPairTargetLang]}
+                  </span>
+                  {contentPairTargetLang === "aki" && content.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => void copyFullAkiColumn()}
+                      className="shrink-0 px-3 py-1.5 bg-ink text-paper text-[10px] font-sans font-bold uppercase tracking-wider rounded-full hover:bg-vibrant-1 transition-colors"
+                      title="复制 AKI 密文与本站链接（不含彩蛋说明文字）"
+                      aria-label="复制 AKI 密文与网站链接"
+                    >
+                      复制
+                    </button>
+                  ) : null}
                 </div>
               </div>
               {content.map((pair, paraIndex) => {
@@ -1642,7 +1876,7 @@ export default function App() {
                   <div className="relative grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 items-start">
                     {/* 原文 — 选字批注 */}
                     <div
-                      className="content-text whitespace-pre-wrap text-ink/80"
+                      className={`content-text whitespace-pre-wrap text-ink/80 ${akiDecodeLayout ? "font-mono text-sm tracking-tight" : ""}`}
                       data-para-original={paraIndex}
                       onMouseUp={() => handleTextSelect(paraIndex)}
                     >
@@ -1654,8 +1888,16 @@ export default function App() {
 
                     {/* 译文 */}
                     <div
-                      className={`content-text whitespace-pre-wrap ${contentPairTargetLang === "morse" ? "font-mono text-sm tracking-tight" : "content-text-zh"}`}
+                      className={`content-text whitespace-pre-wrap ${
+                        akiDecodeLayout
+                          ? "content-text-zh"
+                          : contentPairTargetLang === "morse" || contentPairTargetLang === "aki"
+                            ? "font-mono text-sm tracking-tight"
+                            : "content-text-zh"
+                      }`}
                       dir={contentPairTargetLang === "ar" ? "rtl" : undefined}
+                      data-aki-translated={contentPairTargetLang === "aki" ? "1" : undefined}
+                      onCopy={handleAkiTranslatedCopy}
                     >
                       {renderSearchHighlightedText(
                         getTranslatedColumnText(pair, contentPairTargetLang),
@@ -1773,137 +2015,9 @@ export default function App() {
                 );
               })}
             </article>
+            </>
             )}
 
-            {/* Analysis Section */}
-            {analysis && (
-              <motion.section 
-                initial={{ opacity: 0, y: 60 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true }}
-                transition={{ duration: 1 }}
-                className="mt-48 p-12 md:p-20 rounded-[4rem] bg-white/20 backdrop-blur-3xl border border-white/30 shadow-2xl shadow-vibrant-1/5 overflow-hidden relative"
-              >
-                <div className="absolute top-0 right-0 w-96 h-96 bg-vibrant-1/5 blur-[100px] rounded-full -mr-48 -mt-48" />
-                
-                <div className="space-y-20 relative z-10">
-                  {/* Overview */}
-                  <div>
-                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Overview / 概览</h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24">
-                      <p className="text-xl md:text-2xl font-serif leading-relaxed italic text-ink/90">
-                        "{analysis.summary.en}"
-                      </p>
-                      <p className="text-xl md:text-2xl font-serif-zh leading-relaxed italic text-ink/90">
-                        "{analysis.summary.zh}"
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Key Themes */}
-                  <div>
-                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-6 font-bold opacity-40">Key Themes / 核心主题</h3>
-                    <div className="flex flex-wrap gap-2">
-                      {analysis.themes.map((theme, i) => (
-                        <span key={i} className="px-3 py-1.5 rounded-full bg-ink/5 text-[10px] font-sans font-bold uppercase tracking-wider opacity-60">
-                          {[theme.en, theme.zh].filter(Boolean).join(' / ')}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Narrative Analysis */}
-                  <div>
-                    <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Narrative Analysis / 叙事深度解析</h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24">
-                      <div className="text-base md:text-lg font-serif leading-[1.8] text-ink/70 space-y-4 italic">
-                        {analysis.narrativeDetail.en.split('\n').map((para, i) => (
-                          <p key={i}>{para}</p>
-                        ))}
-                      </div>
-                      <div className="text-base md:text-lg font-serif-zh leading-[1.8] text-ink/80 space-y-4">
-                        {analysis.narrativeDetail.zh.split('\n').map((para, i) => (
-                          <p key={i}>{para}</p>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Plot Synopsis / 剧情梗概 */}
-                  {analysis.plotSynopsis && (analysis.plotSynopsis.en || analysis.plotSynopsis.zh) && (
-                    <div className="pt-16 border-t border-ink/5">
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Plot Synopsis / 剧情梗概</h3>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24">
-                        <div className="text-base md:text-lg font-serif leading-[1.8] text-ink/70 space-y-4 italic">
-                          {analysis.plotSynopsis.en.split('\n').map((para, i) => (
-                            <p key={i}>{para}</p>
-                          ))}
-                        </div>
-                        <div className="text-base md:text-lg font-serif-zh leading-[1.8] text-ink/80 space-y-4">
-                          {analysis.plotSynopsis.zh.split('\n').map((para, i) => (
-                            <p key={i}>{para}</p>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Characters / 人物介绍 */}
-                  {analysis.characters && analysis.characters.length > 0 && (
-                    <div className="pt-16 border-t border-ink/5">
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold opacity-40">Characters / 人物介绍</h3>
-                      <div className="space-y-10">
-                        {analysis.characters.map((char, i) => (
-                          <div key={i} className="grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-24 p-6 rounded-2xl bg-ink/[0.02]">
-                            <div>
-                              <h4 className="font-serif font-bold text-lg text-ink/90 mb-2">{char.name.en}</h4>
-                              <p className="text-sm font-serif italic leading-relaxed text-ink/60">{char.description.en}</p>
-                            </div>
-                            <div>
-                              <h4 className="font-serif-zh font-bold text-lg text-ink/90 mb-2">{char.name.zh}</h4>
-                              <p className="text-sm font-serif-zh leading-relaxed text-ink/70">{char.description.zh}</p>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Pros & Cons */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-16 pt-16 border-t border-ink/5">
-                    <div>
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold text-vibrant-1">Strengths / 写作优点</h3>
-                      <ul className="space-y-6">
-                        {analysis.pros.map((pro, i) => (
-                          <li key={i} className="flex items-start gap-4 group">
-                            <span className="text-[10px] mt-2 font-sans font-bold text-vibrant-1/30 group-hover:text-vibrant-1 transition-colors">0{i+1}</span>
-                            <div>
-                              {pro.en && <p className="text-sm font-serif italic text-ink/50 mb-1">{pro.en}</p>}
-                              {pro.zh && <p className="text-lg font-serif-zh text-ink/80">{pro.zh}</p>}
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-
-                    <div>
-                      <h3 className="font-sans text-[10px] uppercase tracking-[0.4em] mb-8 font-bold text-vibrant-2">Critique / 写作缺点</h3>
-                      <ul className="space-y-6">
-                        {analysis.cons.map((con, i) => (
-                          <li key={i} className="flex items-start gap-4 group">
-                            <span className="text-[10px] mt-2 font-sans font-bold text-vibrant-2/30 group-hover:text-vibrant-2 transition-colors">0{i+1}</span>
-                            <div>
-                              {con.en && <p className="text-sm font-serif italic text-ink/50 mb-1">{con.en}</p>}
-                              {con.zh && <p className="text-lg font-serif-zh text-ink/80">{con.zh}</p>}
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-                </div>
-              </motion.section>
-            )}
           </>
         )}
 
@@ -1919,17 +2033,8 @@ export default function App() {
           </div>
         )}
 
-        {/* Footer */}
-        <footer className="mt-48 pt-16 border-t border-ink/5 text-center">
-          <div className="flex justify-center mb-12">
-            <div className="p-5 rounded-full bg-white/40 backdrop-blur-md shadow-xl border border-white/50">
-              <BookOpen className="w-6 h-6 text-vibrant-1" />
-            </div>
-          </div>
-          <p className="font-sans text-[10px] uppercase tracking-[0.6em] font-bold opacity-20">
-            © 2026 The Bilingual Review • Crafted with DeepSeek AI
-          </p>
-        </footer>
+        {/* Footer spacer */}
+        <div className="mt-48" />
       </main>
 
       <FloatingTextFollowup

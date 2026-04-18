@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode.js';
+import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
 
 const CHUNK_SIZE = 10000;
 
@@ -283,9 +284,9 @@ function buildZhToEnTranslationOnlyPrompt(paragraphs: string[]): string {
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse';
+type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse' | 'aki';
 
-const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse']);
+const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse', 'aki']);
 
 function normalizeTargetLang(raw: string | undefined): TargetLang {
   const r = typeof raw === 'string' ? raw.trim() : '';
@@ -389,13 +390,28 @@ function resolveTranslationFlow(
     };
   }
 
+  if (targetLang === 'aki') {
+    if (sourceLang === 'zh') {
+      return {
+        analysisLang: 'zh',
+        layout: 'to_cjk',
+        transPrompt: buildZhToEnTranslationOnlyPrompt,
+      };
+    }
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToEnPrompt(chunk, sourceLang),
+    };
+  }
+
   return { error: '无法解析翻译方向' };
 }
 
 function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string, targetLang: string): string {
   const srcLabel = LANG_NAMES[sourceLang] || '外文';
-  // morse 的目标栏先用英文产出，后续由服务端做摩斯编码
-  const effectiveTarget = targetLang === 'morse' ? 'en' : targetLang;
+  // morse / aki 的目标栏先用英文产出，后续由服务端做编码
+  const effectiveTarget = (targetLang === 'morse' || targetLang === 'aki') ? 'en' : targetLang;
   const tgtLabel = LANG_NAMES[effectiveTarget] || '目标语言';
   return `你是一个专业的中英双语文学编辑。请对以下${srcLabel}文章进行结构化写作分析，并提取标题和作者。
 
@@ -465,6 +481,16 @@ function applyMorseToTitleAuthorSlots(
   const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
   const morse = encodeInternationalMorse(t[tgtKey]);
   return { ...t, [tgtKey]: morse || '—' };
+}
+
+/** 对 title / author 的「译文栏」施加 AKI码 编码 */
+function applyAkiToTitleAuthorSlots(
+  t: { en: string; zh: string },
+  layout: 'to_cjk' | 'to_en'
+): { en: string; zh: string } {
+  const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
+  const aki = wrapAkiDisplayIfFirst(encodeAki(t[tgtKey]), false);
+  return { ...t, [tgtKey]: aki || '—' };
 }
 
 const sanitizeJson = (s: string) => s.replace(/,(\s*[\]}])/g, '$1');
@@ -564,7 +590,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const total = chunks.length;
     const allTranslations: { en: string; zh: string }[][] = new Array(total);
     const englishPairsForMorseFallback: { en: string; zh: string }[][] | undefined =
-      targetLang === 'morse' ? new Array(total) : undefined;
+      (targetLang === 'morse' || targetLang === 'aki') ? new Array(total) : undefined;
     let completedCount = 0;
 
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
@@ -579,7 +605,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, layout) : [];
         if (englishPairsForMorseFallback) englishPairsForMorseFallback[i] = chunkPairs;
         const chunkPairsOut =
-          targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs) : chunkPairs;
+          targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs)
+          : targetLang === 'aki' ? applyAkiEncodingToPairs(chunkPairs, layout)
+          : chunkPairs;
         allTranslations[i] = chunkPairsOut;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);
@@ -600,7 +628,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let author = mapTitleAuthorToSlots(analysisJson?.author, layout);
 
     const flatForTitleFallback =
-      englishPairsForMorseFallback && targetLang === 'morse'
+      englishPairsForMorseFallback && (targetLang === 'morse' || targetLang === 'aki')
         ? englishPairsForMorseFallback.flat()
         : flatTranslations;
     const fallback = extractTitleAuthorFromTranslation(flatForTitleFallback);
@@ -618,6 +646,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (targetLang === 'morse') {
       title = applyMorseToTitleAuthorSlots(title, layout);
       author = applyMorseToTitleAuthorSlots(author, layout);
+    }
+    if (targetLang === 'aki') {
+      title = applyAkiToTitleAuthorSlots(title, layout);
+      author = applyAkiToTitleAuthorSlots(author, layout);
     }
 
     const analysis = normalizeAnalysis(analysisJson?.analysis);

@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode.js';
+import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from '../lib/customCipher.js';
 
 const CHUNK_SIZE = 10000;
 
@@ -193,9 +194,9 @@ const LANG_NAMES: Record<string, string> = {
 };
 
 
-type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse';
+type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse' | 'aki';
 
-const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse']);
+const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse', 'aki']);
 
 function normalizeTargetLang(raw: string | undefined): TargetLang {
   const r = typeof raw === 'string' ? raw.trim() : '';
@@ -285,6 +286,21 @@ function resolveTranslationFlow(
   }
 
   if (targetLang === 'morse') {
+    if (sourceLang === 'zh') {
+      return {
+        analysisLang: 'zh',
+        layout: 'to_cjk',
+        transPrompt: buildZhToEnTranslationOnlyPrompt,
+      };
+    }
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToEnPrompt(chunk, sourceLang),
+    };
+  }
+
+  if (targetLang === 'aki') {
     if (sourceLang === 'zh') {
       return {
         analysisLang: 'zh',
@@ -440,8 +456,8 @@ async function callDeepSeek(prompt: string, apiKey: string): Promise<Record<stri
 
 function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string, targetLang: string): string {
   const srcLabel = LANG_NAMES[sourceLang] || '外文';
-  // morse 的目标栏先用英文产出，后续由服务端做摩斯编码
-  const effectiveTarget = targetLang === 'morse' ? 'en' : targetLang;
+  // morse / aki 的目标栏先用英文产出，后续由服务端做编码
+  const effectiveTarget = (targetLang === 'morse' || targetLang === 'aki') ? 'en' : targetLang;
   const tgtLabel = LANG_NAMES[effectiveTarget] || '目标语言';
   return `你是一个专业的中英双语文学编辑。请对以下${srcLabel}文章进行结构化写作分析，并提取标题和作者。
 
@@ -511,6 +527,16 @@ function applyMorseToTitleAuthorSlots(
   const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
   const morse = encodeInternationalMorse(t[tgtKey]);
   return { ...t, [tgtKey]: morse || '—' };
+}
+
+/** 对 title / author 的「译文栏」施加 AKI码 编码 */
+function applyAkiToTitleAuthorSlots(
+  t: { en: string; zh: string },
+  layout: 'to_cjk' | 'to_en'
+): { en: string; zh: string } {
+  const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
+  const aki = wrapAkiDisplayIfFirst(encodeAki(t[tgtKey]), false);
+  return { ...t, [tgtKey]: aki || '—' };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -584,10 +610,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       title = applyMorseToTitleAuthorSlots(title, layout);
       author = applyMorseToTitleAuthorSlots(author, layout);
     }
+    if (targetLang === 'aki') {
+      title = applyAkiToTitleAuthorSlots(title, layout);
+      author = applyAkiToTitleAuthorSlots(author, layout);
+    }
 
     const analysis = normalizeAnalysis(analysisJson?.analysis);
     const translationOut =
-      targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations) : allTranslations;
+      targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations)
+      : targetLang === 'aki' ? applyAkiEncodingToPairs(allTranslations, layout)
+      : allTranslations;
     return res.status(200).json({ title, author, translation: translationOut, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';

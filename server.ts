@@ -10,6 +10,8 @@ import JSON5 from 'json5';
 import multer from 'multer';
 import { OfficeParser as officeParser } from 'officeparser';
 import { applyMorseEncodingToPairs, encodeInternationalMorse } from './lib/morseEncode.ts';
+import { applyAkiEncodingToPairs, encodeAki, wrapAkiDisplayIfFirst } from './lib/customCipher.ts';
+import { buildRefineAkiZhPrompt, mergeRefinedParagraphs } from './lib/refineAkiZh.ts';
 
 // ── 翻译结果内存缓存（基于内容哈希，最多缓存 100 条，30 分钟过期） ──
 const CACHE_MAX = 100;
@@ -287,9 +289,9 @@ function buildTranslationToArPrompt(paragraphs: string[], fromLang = 'en'): stri
 ${paragraphs.map((p, i) => `# Paragraph ${i + 1}\n${p}`).join('\n\n')}`.trim();
 }
 
-type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse';
+type TargetLang = 'zh' | 'zh-TW' | 'en' | 'ja' | 'fr' | 'de' | 'ar' | 'morse' | 'aki';
 
-const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse']);
+const VALID_TARGET_LANGS = new Set<string>(['zh', 'zh-TW', 'en', 'ja', 'fr', 'de', 'ar', 'morse', 'aki']);
 
 function normalizeTargetLang(raw: string | undefined): TargetLang {
   const r = typeof raw === 'string' ? raw.trim() : '';
@@ -393,13 +395,28 @@ function resolveTranslationFlow(
     };
   }
 
+  if (targetLang === 'aki') {
+    if (sourceLang === 'zh') {
+      return {
+        analysisLang: 'zh',
+        layout: 'to_cjk',
+        transPrompt: buildZhToEnTranslationOnlyPrompt,
+      };
+    }
+    return {
+      analysisLang: sourceLang,
+      layout: 'to_cjk',
+      transPrompt: (chunk: string[]) => buildTranslationToEnPrompt(chunk, sourceLang),
+    };
+  }
+
   return { error: '无法解析翻译方向' };
 }
 
 function buildAnalysisOnlyPrompt(paragraphs: string[], sourceLang: string, targetLang: string): string {
   const srcLabel = LANG_NAMES[sourceLang] || '外文';
-  // morse 的目标栏先用英文产出，后续由服务端做摩斯编码
-  const effectiveTarget = targetLang === 'morse' ? 'en' : targetLang;
+  // morse / aki 的目标栏先用英文产出，后续由服务端做编码
+  const effectiveTarget = (targetLang === 'morse' || targetLang === 'aki') ? 'en' : targetLang;
   const tgtLabel = LANG_NAMES[effectiveTarget] || '目标语言';
   return `你是一个专业的中英双语文学编辑。请对以下${srcLabel}文章进行结构化写作分析，并提取标题和作者。
 
@@ -472,6 +489,16 @@ function applyMorseToTitleAuthorSlots(
   const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
   const morse = encodeInternationalMorse(t[tgtKey]);
   return { ...t, [tgtKey]: morse || '—' };
+}
+
+/** 对 title / author 的「译文栏」施加 AKI码 编码 */
+function applyAkiToTitleAuthorSlots(
+  t: { en: string; zh: string },
+  layout: 'to_cjk' | 'to_en'
+): { en: string; zh: string } {
+  const tgtKey: 'en' | 'zh' = layout === 'to_en' ? 'en' : 'zh';
+  const aki = wrapAkiDisplayIfFirst(encodeAki(t[tgtKey]), false);
+  return { ...t, [tgtKey]: aki || '—' };
 }
 
 type BilingualStr = { en: string; zh: string };
@@ -693,6 +720,31 @@ app.post('/api/extract-text', upload.single('file'), async (req, res) => {
   }
 });
 
+/** AKI 解码后的中文润色（修正拼音还原误差） */
+app.post('/api/refine-zh', async (req, res) => {
+  const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
+  const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
+  if (!DEEPSEEK_API_KEY || placeholders.some(p => DEEPSEEK_API_KEY.includes(p))) {
+    return res.status(503).json({
+      error: '请先配置 DeepSeek API Key。在 bilingual-editorial 目录下创建 .env.local，填写：DEEPSEEK_API_KEY=你的密钥'
+    });
+  }
+  try {
+    const { paragraphs } = req.body as { paragraphs?: string[] };
+    if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+      return res.status(400).json({ error: 'paragraphs is required' });
+    }
+    const prompt = buildRefineAkiZhPrompt(paragraphs.map(p => String(p ?? '')));
+    const json = await callDeepSeekCached(prompt, DEEPSEEK_API_KEY);
+    const refined = mergeRefinedParagraphs(paragraphs, json.paragraphs);
+    return res.json({ paragraphs: refined });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Internal error';
+    console.error(err);
+    return res.status(500).json({ error: msg });
+  }
+});
+
 app.post('/api/translate', async (req, res) => {
   const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || '').trim();
   const placeholders = ['YOUR_DEEPSEEK_API_KEY', '你的DeepSeek密钥', '你的密钥'];
@@ -762,10 +814,16 @@ app.post('/api/translate', async (req, res) => {
       title = applyMorseToTitleAuthorSlots(title, layout);
       author = applyMorseToTitleAuthorSlots(author, layout);
     }
+    if (targetLang === 'aki') {
+      title = applyAkiToTitleAuthorSlots(title, layout);
+      author = applyAkiToTitleAuthorSlots(author, layout);
+    }
 
     const analysis = normalizeAnalysis(analysisJson?.analysis);
     const translationOut =
-      targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations) : allTranslations;
+      targetLang === 'morse' ? applyMorseEncodingToPairs(allTranslations)
+      : targetLang === 'aki' ? applyAkiEncodingToPairs(allTranslations, layout)
+      : allTranslations;
     return res.json({ title, author, translation: translationOut, analysis });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Internal error';
@@ -821,7 +879,7 @@ app.post('/api/translate-stream', async (req, res) => {
     const total = chunks.length;
     const allTranslations: { en: string; zh: string }[][] = new Array(total);
     const englishPairsForMorseFallback: { en: string; zh: string }[][] | undefined =
-      targetLang === 'morse' ? new Array(total) : undefined;
+      (targetLang === 'morse' || targetLang === 'aki') ? new Array(total) : undefined;
     let completedCount = 0;
 
     write({ type: 'progress', chunk: 0, total, percent: 0, step: `准备翻译共 ${total} 段...` });
@@ -835,7 +893,9 @@ app.post('/api/translate-stream', async (req, res) => {
         const chunkPairs = chunkRaw.length > 0 ? mergeTranslation(chunk, chunkRaw, layout) : [];
         if (englishPairsForMorseFallback) englishPairsForMorseFallback[i] = chunkPairs;
         const chunkPairsOut =
-          targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs) : chunkPairs;
+          targetLang === 'morse' ? applyMorseEncodingToPairs(chunkPairs)
+          : targetLang === 'aki' ? applyAkiEncodingToPairs(chunkPairs, layout)
+          : chunkPairs;
         allTranslations[i] = chunkPairsOut;
         completedCount++;
         const pct = Math.round((completedCount / total) * 100);
@@ -858,7 +918,7 @@ app.post('/api/translate-stream', async (req, res) => {
     let author = mapTitleAuthorToSlots(analysisJson?.author, layout);
 
     const flatForTitleFallback =
-      englishPairsForMorseFallback && targetLang === 'morse'
+      englishPairsForMorseFallback && (targetLang === 'morse' || targetLang === 'aki')
         ? englishPairsForMorseFallback.flat()
         : flatTranslations;
     const fallback = extractTitleAuthorFromTranslation(flatForTitleFallback);
@@ -876,6 +936,10 @@ app.post('/api/translate-stream', async (req, res) => {
     if (targetLang === 'morse') {
       title = applyMorseToTitleAuthorSlots(title, layout);
       author = applyMorseToTitleAuthorSlots(author, layout);
+    }
+    if (targetLang === 'aki') {
+      title = applyAkiToTitleAuthorSlots(title, layout);
+      author = applyAkiToTitleAuthorSlots(author, layout);
     }
 
     const analysis = normalizeAnalysis(analysisJson?.analysis);

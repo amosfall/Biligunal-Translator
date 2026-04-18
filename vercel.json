@@ -11,6 +11,10 @@
       "maxDuration": 300,
       "includeFiles": "lib/**"
     },
-    "api/text-followup.ts": { "maxDuration": 120 }
+    "api/text-followup.ts": { "maxDuration": 120 },
+    "api/refine-zh.ts": {
+      "maxDuration": 120,
+      "includeFiles": "lib/**"
+    }
   }
 }

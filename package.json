@@ -1,5 +1,5 @@
 {
-  "name": "react-example",
+  "name": "akis-translator",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -11,7 +11,8 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "start": "concurrently \"npm run server\" \"npm run dev\"",
-    "merge-history": "tsx scripts/merge-history-username.ts"
+    "merge-history": "tsx scripts/merge-history-username.ts",
+    "gen:uni-nicks": "node scripts/generate-uni-nickname-supplement.mjs"
   },
   "dependencies": {
     "@clerk/backend": "^3.2.7",
@@ -32,6 +33,7 @@
     "multer": "^2.1.0",
     "officeparser": "^6.0.4",
     "pdfjs-dist": "^5.4.624",
+    "pinyin-pro": "^3.28.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "vite": "^6.2.0"

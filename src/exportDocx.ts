@@ -31,7 +31,7 @@ interface Annotation {
 
 type Annotations = Annotation[];
 
-type ExportTargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse";
+type ExportTargetLang = "zh" | "zh-TW" | "en" | "ja" | "fr" | "de" | "ar" | "morse" | "aki";
 
 interface ExportOptions {
   title: { en: string; zh: string };
