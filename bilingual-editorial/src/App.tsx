@@ -240,7 +240,7 @@ const DEMO_TITLE = { en: "To\nStéphane", zh: "致\n斯蒂芬" };
 const DEMO_AUTHOR = { en: "Eileen Myles", zh: "艾琳·迈尔斯" };
 const DEMO_CONTENT: ParagraphPair[] = [
   {
-    en: `Dear Stéphane,\nIt's your birthday. You'd be 61born in 61. I'm thinking of you as the stars fan out in the sky tonight as I walk my dog. It strikes me that the extreme head racket that occupies so much of your work is stellar: "Oy Suzy" there goes one, yet my feeling about the text written alongside one image or the flowers popped in around the jabber is that it is never very much about "one" speaking at all.`,
+    en: `Dear Stéphane,\nIt's your birthday. You'd be 61, born in '61. I'm thinking of you as the stars fan out in the sky tonight as I walk my dog. It strikes me that the extreme head racket that occupies so much of your work is stellar: "Oy Suzy" there goes one, yet my feeling about the text written alongside one image or the flowers popped in around the jabber is that it is never very much about "one" speaking at all.`,
     zh: `亲爱的斯蒂芬，\n今天是你的生日。你会61岁，出生于1961年。我在遛狗的时候，抬头看着天上星星点点，想着你。你的作品中充满了那种喧嚣的头脑轰鸣，让我想起星辰的闪烁。\u201C喂，苏西，\u201D一颗星滑落，但我感觉那些伴随图像而写的文字，或插入在喋喋不休中的花朵，从来都不是关于某个\u201C人\u201D在发声。`,
   },
   {
@@ -301,6 +301,11 @@ export default function App() {
 
   const isLoggedIn = auth.isLoaded && !!auth.userId;
   const localUserBoot = readLocalUsernameBoot();
+
+  /** 当前正文左栏实际语种（与本次 en/zh 数据一致）；栏目标题用此值，避免仅依赖 localStorage 的 sourceLang 与正文错位（如 Demo 英文左栏却显示「繁體中文」） */
+  const [contentPairSourceLang, setContentPairSourceLang] = useState<SourceLang | null>(() =>
+    readLocalUsernameBoot() ? null : "en"
+  );
 
   const [content, setContent] = useState<ParagraphPair[]>(() => (localUserBoot ? [] : DEMO_CONTENT));
   const [analysis, setAnalysis] = useState<ArticleAnalysis | null>(() => (localUserBoot ? null : DEMO_ANALYSIS));
@@ -385,6 +390,7 @@ export default function App() {
       setAuthor({ zh: "", en: "" });
       setAnnotations([]);
       setContentPairTargetLang(targetLang);
+      setContentPairSourceLang(null);
       setHistory((h) => h.map((item) => (item.username ? item : { ...item, username: cur })));
     } else {
       setContent(DEMO_CONTENT);
@@ -393,6 +399,7 @@ export default function App() {
       setAuthor(DEMO_AUTHOR);
       setAnnotations([]);
       setContentPairTargetLang(readStoredTargetLang());
+      setContentPairSourceLang("en");
     }
   }, [auth.isLoaded, auth.userId]);
 
@@ -627,6 +634,9 @@ export default function App() {
     const t = item.targetLang && ALL_TARGET_LANGS.includes(item.targetLang) ? item.targetLang : "zh";
     setTargetLang(t);
     setContentPairTargetLang(t);
+    setContentPairSourceLang(
+      item.sourceLang && ALL_SOURCE_LANGS.includes(item.sourceLang) ? item.sourceLang : "en"
+    );
     setAnnotations(item.annotations ?? []);
     setCurrentHistoryId(item.id);
     setActiveAnnotationId(null);
@@ -956,6 +966,7 @@ export default function App() {
       { title: newTitle, author: newAuthor, content: result.translation, analysis: result.analysis, annotations: [] },
       { sourceLang: apiSourceLang, targetLang: usedTargetLang }
     );
+    setContentPairSourceLang(apiSourceLang);
     setContentPairTargetLang(usedTargetLang);
     setProgress({ percent: 100, step: "完成" });
   };
@@ -1607,7 +1618,9 @@ export default function App() {
               {/* Column labels */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 mb-2">
                 <div>
-                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">{SOURCE_LANG_LABELS[sourceLang] || "Source"}</span>
+                  <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">
+                    {SOURCE_LANG_LABELS[contentPairSourceLang ?? sourceLang] || "Source"}
+                  </span>
                 </div>
                 <div>
                   <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">{TARGET_LANG_LABELS[contentPairTargetLang]}</span>
