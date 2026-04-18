@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import JSON5 from 'json5';
-import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode';
+import { applyMorseEncodingToPairs, encodeInternationalMorse } from '../lib/morseEncode.js';
 
 const CHUNK_SIZE = 10000;
 
