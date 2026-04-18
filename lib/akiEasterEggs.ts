@@ -5,9 +5,6 @@
 
 import { UNIVERSITY_ROWS, type UniVariation } from "./uniEasterData";
 
-/** AKI 静态白名单高校：仅这两条的 match 仍走本地随机梗；其余高校名改由 LLM 动态生成 */
-const AKI_STATIC_UNI_MATCH_KEYS = new Set(["中央戏剧学院", "明治大学"]);
-
 export type AkiEasterKind = "hku" | "i_love_you" | "aki_name";
 
 /** 匹配结果：旧版关键词或高校彩蛋 */
@@ -108,7 +105,6 @@ export function matchAkiEasterEggSource(
   }
 
   for (const row of UNIVERSITY_ROWS) {
-    if (!AKI_STATIC_UNI_MATCH_KEYS.has(row.match)) continue;
     if (uniRowMatchEquals(t, row.match)) {
       return { type: "uni", official: row.match, variations: row.variations };
     }
