@@ -48,7 +48,7 @@ export async function fetchAkiMemePairDeepseek(
           {
             role: "system",
             content:
-              'Valid JSON only: eligible, zh, en. When eligible true: extra mean Chinese roast, often open with 你是一个X人; English may open with You are a... / If you have ever...',
+              'Valid JSON only: eligible, zh, en. When eligible true: zh ~100 Chinese chars (90–110), roast tone; topics include uni/geo/music/literature/film/photo/ACG when user phrase names them; en: ~2 sentences matching zh tone.',
           },
           { role: "user", content: prompt },
         ],
@@ -77,7 +77,7 @@ export async function fetchAkiMemePairDeepseek(
 
   const zh = String(json.zh ?? "")
     .trim()
-    .slice(0, 200);
+    .slice(0, 280);
   const en = String(json.en ?? "")
     .trim()
     .slice(0, 400);

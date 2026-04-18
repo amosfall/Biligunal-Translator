@@ -288,8 +288,8 @@ const UNIVERSITY_ROWS_BASE: UniRow[] = [
     match: "中央戏剧学院",
     variations: [
       {
-        zh: "Aki的本科学校",
-        en: "The Central Academy of Drama—AKI's undergraduate school.",
+        zh: "Aki的本科学校，真是怀念呀！",
+        en: "The Central Academy of Drama—AKI's undergrad days, good old nostalgia.",
       },
     ],
   },

@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback, ChangeEvent } from "react";
-import { isLegacyHkuInput } from "../lib/akiEasterEggs";
+import { isLegacyHkuInput, isLegacyMeijiInput, isLegacyZhongXiInput } from "../lib/akiEasterEggs";
 import { motion, AnimatePresence } from "motion/react";
 import { BookOpen, Menu, Upload, Loader2, AlertCircle, X, Trash2, Database, Monitor, MessageSquare, FileDown, LogOut, ChevronDown, Globe, HelpCircle, Search, ChevronUp } from "lucide-react";
 import mammoth from "mammoth";
@@ -135,6 +135,82 @@ interface ParagraphPair {
   zh: string;
 }
 
+/** 同一轮翻译 / 解码共用一个 errState，避免重复 setError */
+type AkiMemeErrorState = { reported: boolean };
+
+/**
+ * 调用 /api/aki-meme（与 VITE_AKI_MEME_API）；供「译成 AKI」与「AKI 密文解码后补梗」共用。
+ */
+async function fetchAkiMemeApi(
+  memeUrl: string,
+  text: string,
+  setError: React.Dispatch<React.SetStateAction<string | null>>,
+  errState: AkiMemeErrorState
+): Promise<{ zh: string; en: string } | null> {
+  try {
+    const r = await fetch(memeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) {
+      if (!errState.reported) {
+        errState.reported = true;
+        let serverMsg = "";
+        try {
+          const errJson = (await r.json()) as { error?: string };
+          serverMsg = typeof errJson.error === "string" ? errJson.error : "";
+        } catch {
+          /* 可能返回了 HTML 404 页面 */
+        }
+        if (r.status === 503) {
+          setError(
+            serverMsg ||
+              "AKI 动态梗未启用：请在部署环境（如 Vercel）配置 DEEPSEEK_API_KEY，并确保可访问「动态梗」接口。"
+          );
+        } else if (r.status === 404) {
+          setError(
+            "找不到动态梗接口。若前端托管在纯静态站，请在构建环境变量中设置 VITE_AKI_MEME_API 为含 /api/aki-meme 的完整后端地址。"
+          );
+        } else {
+          setError(serverMsg || `动态梗服务不可用（HTTP ${r.status}）。仅显示密文。`);
+        }
+      }
+      return null;
+    }
+    const ct = r.headers.get("content-type") ?? "";
+    if (!ct.includes("json")) {
+      if (!errState.reported) {
+        errState.reported = true;
+        setError(
+          "动态梗接口返回的不是 JSON（多为静态站把 /api 指到了网页，实际没有后端）。请用含 api/ 的 Vercel 全栈部署，或设置 VITE_AKI_MEME_API。"
+        );
+      }
+      return null;
+    }
+    let j: { eligible?: boolean; zh?: string; en?: string };
+    try {
+      j = (await r.json()) as { eligible?: boolean; zh?: string; en?: string };
+    } catch {
+      if (!errState.reported) {
+        errState.reported = true;
+        setError("动态梗接口响应无法解析为 JSON（可能被替换成了 HTML）。");
+      }
+      return null;
+    }
+    if (j.eligible === false) return null;
+    const zh = String(j.zh ?? "").trim();
+    const en = String(j.en ?? "").trim();
+    if (!zh) return null;
+    return { zh, en };
+  } catch {
+    if (!errState.reported) {
+      errState.reported = true;
+      setError(`无法连接动态梗服务（${memeUrl}）。请检查网络、CORS，或配置 VITE_AKI_MEME_API 指向正确的 API 域名。`);
+    }
+    return null;
+  }
+}
 
 function getOriginalColumnText(pair: ParagraphPair, targetLang: TargetLang): string {
   return targetLang === "en" ? pair.zh : pair.en;
@@ -408,6 +484,10 @@ export default function App() {
   const authUserPrevRef = useRef<string | null | undefined>(undefined);
   /** 本会话内是否已用过 HKU 静态彩蛋；再次输入 hku/香港大学则走 LLM 动态梗（与同批后续段落一致） */
   const hkuStaticEggConsumedRef = useRef(false);
+  /** 本会话内是否已用过明治大学静态彩蛋；再次输入「明治大学」则走 LLM 动态梗 */
+  const meijiStaticEggConsumedRef = useRef(false);
+  /** 本会话内是否已用过中央戏剧学院静态彩蛋；再次输入「中央戏剧学院」则走 LLM 动态梗 */
+  const zhongXiStaticEggConsumedRef = useRef(false);
 
   /** 从未选过目标语时：游客保持默认 AKI；已登录用户回落为简体中文（与历史产品习惯一致） */
   useLayoutEffect(() => {
@@ -1039,81 +1119,27 @@ export default function App() {
     if (usedTargetLang === "aki") {
       setProgress({ percent: 40, step: "正在翻译..." });
       const memeUrl = getAkiMemeApiUrl();
-      let memeApiErrorReported = false;
-      const fetchMeme = async (text: string) => {
-        try {
-          const r = await fetch(memeUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }),
-          });
-          if (!r.ok) {
-            if (!memeApiErrorReported) {
-              memeApiErrorReported = true;
-              let serverMsg = "";
-              try {
-                const errJson = (await r.json()) as { error?: string };
-                serverMsg = typeof errJson.error === "string" ? errJson.error : "";
-              } catch {
-                /* 可能返回了 HTML 404 页面 */
-              }
-              if (r.status === 503) {
-                setError(
-                  serverMsg ||
-                    "AKI 动态梗未启用：请在部署环境（如 Vercel）配置 DEEPSEEK_API_KEY，并确保可访问「动态梗」接口。"
-                );
-              } else if (r.status === 404) {
-                setError(
-                  "找不到动态梗接口。若前端托管在纯静态站，请在构建环境变量中设置 VITE_AKI_MEME_API 为含 /api/aki-meme 的完整后端地址。"
-                );
-              } else {
-                setError(serverMsg || `动态梗服务不可用（HTTP ${r.status}）。仅显示密文。`);
-              }
-            }
-            return null;
-          }
-          const ct = r.headers.get("content-type") ?? "";
-          if (!ct.includes("json")) {
-            if (!memeApiErrorReported) {
-              memeApiErrorReported = true;
-              setError(
-                "动态梗接口返回的不是 JSON（多为静态站把 /api 指到了网页，实际没有后端）。请用含 api/ 的 Vercel 全栈部署，或设置 VITE_AKI_MEME_API。"
-              );
-            }
-            return null;
-          }
-          let j: { eligible?: boolean; zh?: string; en?: string };
-          try {
-            j = (await r.json()) as { eligible?: boolean; zh?: string; en?: string };
-          } catch {
-            if (!memeApiErrorReported) {
-              memeApiErrorReported = true;
-              setError("动态梗接口响应无法解析为 JSON（可能被替换成了 HTML）。");
-            }
-            return null;
-          }
-          if (j.eligible === false) return null;
-          const zh = String(j.zh ?? "").trim();
-          const en = String(j.en ?? "").trim();
-          if (!zh) return null;
-          return { zh, en };
-        } catch {
-          if (!memeApiErrorReported) {
-            memeApiErrorReported = true;
-            setError(
-              `无法连接动态梗服务（${memeUrl}）。请检查网络、CORS，或配置 VITE_AKI_MEME_API 指向正确的 API 域名。`
-            );
-          }
-          return null;
-        }
-      };
+      const memeErrState: AkiMemeErrorState = { reported: false };
+      const fetchMeme = (t: string) => fetchAkiMemeApi(memeUrl, t, setError, memeErrState);
       const sessionHkuConsumed = hkuStaticEggConsumedRef.current;
+      const sessionMeijiConsumed = meijiStaticEggConsumedRef.current;
+      const sessionZhongXiConsumed = zhongXiStaticEggConsumedRef.current;
       const translation = await Promise.all(
         paragraphs.map((p, idx) => {
           const priorHkuInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyHkuInput(pr)).length;
           const skipLegacyHku =
             isLegacyHkuInput(p) && (priorHkuInDoc > 0 || sessionHkuConsumed);
-          return buildAkiTranslatedColumnAsync(p, idx, fetchMeme, { skipLegacyHku }).then((zh) => ({
+          const priorMeijiInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyMeijiInput(pr)).length;
+          const skipLegacyMeiji =
+            isLegacyMeijiInput(p) && (priorMeijiInDoc > 0 || sessionMeijiConsumed);
+          const priorZhongXiInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyZhongXiInput(pr)).length;
+          const skipLegacyZhongXi =
+            isLegacyZhongXiInput(p) && (priorZhongXiInDoc > 0 || sessionZhongXiConsumed);
+          return buildAkiTranslatedColumnAsync(p, idx, fetchMeme, {
+            skipLegacyHku,
+            skipLegacyMeiji,
+            skipLegacyZhongXi,
+          }).then((zh) => ({
             en: p,
             zh,
           }));
@@ -1126,6 +1152,22 @@ export default function App() {
       });
       if (showedStaticHkuThisJob) {
         hkuStaticEggConsumedRef.current = true;
+      }
+      const showedStaticMeijiThisJob = paragraphs.some((p, idx) => {
+        const priorMeijiInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyMeijiInput(pr)).length;
+        const skip = isLegacyMeijiInput(p) && (priorMeijiInDoc > 0 || sessionMeijiConsumed);
+        return isLegacyMeijiInput(p) && !skip;
+      });
+      if (showedStaticMeijiThisJob) {
+        meijiStaticEggConsumedRef.current = true;
+      }
+      const showedStaticZhongXiThisJob = paragraphs.some((p, idx) => {
+        const priorZhongXiInDoc = paragraphs.slice(0, idx).filter((pr) => isLegacyZhongXiInput(pr)).length;
+        const skip = isLegacyZhongXiInput(p) && (priorZhongXiInDoc > 0 || sessionZhongXiConsumed);
+        return isLegacyZhongXiInput(p) && !skip;
+      });
+      if (showedStaticZhongXiThisJob) {
+        zhongXiStaticEggConsumedRef.current = true;
       }
       const result: TranslateResult = {
         title: { en: "—", zh: "—" },
@@ -1305,7 +1347,7 @@ export default function App() {
       }
       if (paragraphs.length === 0) throw new Error("文档内容为空");
 
-      setProgress({ percent: 50, step: "正在解码 AKI码..." });
+      setProgress({ percent: 50, step: "加载中…" });
       const eggTails: string[] = [];
       const roughMains = paragraphs.map((p) => {
         const { cipherBlock, eggTail } = splitAkiPasteIntoCipherAndEgg(p);
@@ -1314,7 +1356,7 @@ export default function App() {
       });
       let refinedMains = roughMains;
       if (roughMains.some(shouldRefineDecodedAkiText)) {
-        setProgress({ percent: 62, step: "正在用模型修正中文…" });
+        setProgress({ percent: 62, step: "加载中…" });
         try {
           const res = await fetch("/api/refine-zh", {
             method: "POST",
@@ -1331,12 +1373,63 @@ export default function App() {
           /* 离线或未配置 API：保留本地拼音还原结果 */
         }
       }
-      const zhList = paragraphs.map((_p, i) => {
-        const main = refinedMains[i] ?? roughMains[i] ?? "—";
-        const tail = eggTails[i]?.trim();
-        if (!tail) return main;
-        return [main, tail].join("\n\n");
+
+      /** 解码后右栏：明文 + 与「译成 AKI」相同的静态/动态梗（粘贴里已带彩蛋尾则不再生成） */
+      setProgress({ percent: 68, step: "加载中…" });
+      const memeUrl = getAkiMemeApiUrl();
+      const decodeMemeErrState: AkiMemeErrorState = { reported: false };
+      const fetchMemeForDecode = (t: string) => fetchAkiMemeApi(memeUrl, t, setError, decodeMemeErrState);
+      const sessionHkuDec = hkuStaticEggConsumedRef.current;
+      const sessionMeijiDec = meijiStaticEggConsumedRef.current;
+      const sessionZhongXiDec = zhongXiStaticEggConsumedRef.current;
+
+      const zhList = await Promise.all(
+        refinedMains.map(async (_main, idx) => {
+          const mainText = (refinedMains[idx] ?? roughMains[idx] ?? "—").trim() || "—";
+          const pastedTail = eggTails[idx]?.trim();
+          if (pastedTail) {
+            return [mainText, pastedTail].join("\n\n");
+          }
+          const priorHkuInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyHkuInput(pr)).length;
+          const skipLegacyHku =
+            isLegacyHkuInput(mainText) && (priorHkuInDoc > 0 || sessionHkuDec);
+          const priorMeijiInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyMeijiInput(pr)).length;
+          const skipLegacyMeiji =
+            isLegacyMeijiInput(mainText) && (priorMeijiInDoc > 0 || sessionMeijiDec);
+          const priorZhongXiInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyZhongXiInput(pr)).length;
+          const skipLegacyZhongXi =
+            isLegacyZhongXiInput(mainText) && (priorZhongXiInDoc > 0 || sessionZhongXiDec);
+
+          const fullAkiColumn = await buildAkiTranslatedColumnAsync(mainText, idx, fetchMemeForDecode, {
+            skipLegacyHku,
+            skipLegacyMeiji,
+            skipLegacyZhongXi,
+          });
+          const eggFromBuild = splitAkiPasteIntoCipherAndEgg(fullAkiColumn).eggTail.trim();
+          if (!eggFromBuild) return mainText;
+          return [mainText, eggFromBuild].join("\n\n");
+        })
+      );
+
+      const showedStaticHkuDecode = refinedMains.some((p, idx) => {
+        const priorHkuInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyHkuInput(pr)).length;
+        const skip = isLegacyHkuInput(p) && (priorHkuInDoc > 0 || sessionHkuDec);
+        return isLegacyHkuInput(p) && !skip;
       });
+      if (showedStaticHkuDecode) hkuStaticEggConsumedRef.current = true;
+      const showedStaticMeijiDecode = refinedMains.some((p, idx) => {
+        const priorMeijiInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyMeijiInput(pr)).length;
+        const skip = isLegacyMeijiInput(p) && (priorMeijiInDoc > 0 || sessionMeijiDec);
+        return isLegacyMeijiInput(p) && !skip;
+      });
+      if (showedStaticMeijiDecode) meijiStaticEggConsumedRef.current = true;
+      const showedStaticZhongXiDecode = refinedMains.some((p, idx) => {
+        const priorZxInDoc = refinedMains.slice(0, idx).filter((pr) => isLegacyZhongXiInput(pr)).length;
+        const skip = isLegacyZhongXiInput(p) && (priorZxInDoc > 0 || sessionZhongXiDec);
+        return isLegacyZhongXiInput(p) && !skip;
+      });
+      if (showedStaticZhongXiDecode) zhongXiStaticEggConsumedRef.current = true;
+
       const translation = paragraphs.map((p, i) => ({
         en: p,
         zh: zhList[i] ?? "—",
@@ -1482,25 +1575,25 @@ export default function App() {
       <div className="vibrant-bg" />
       
       {/* Navigation */}
-      <nav className="sticky top-0 z-50 glass-nav px-6 py-4">
-        <div className="max-w-6xl mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-6">
+      <nav className="sticky top-0 z-50 glass-nav px-3 sm:px-6 py-3 sm:py-4 pt-[max(0.75rem,env(safe-area-inset-top))]">
+        <div className="max-w-6xl mx-auto flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center sm:gap-4">
+          <div className="flex items-center gap-3 sm:gap-6 min-w-0 shrink-0">
             <button
               onClick={() => setHistoryOpen(true)}
-              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
+              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors touch-manipulation"
               aria-label="历史记录"
             >
               <Menu className="w-5 h-5 hover:text-vibrant-1 transition-colors" />
             </button>
             <button
               onClick={() => setImportOpen(!importOpen)}
-              className="group flex items-center gap-2 text-xs uppercase tracking-widest font-sans font-bold hover:text-vibrant-1 transition-all disabled:opacity-30"
+              className="group flex items-center gap-2 text-[10px] sm:text-xs uppercase tracking-widest font-sans font-bold hover:text-vibrant-1 transition-all disabled:opacity-30 touch-manipulation"
               disabled={isTranslating}
             >
               <div className="p-2 bg-ink text-paper rounded-full group-hover:bg-vibrant-1 transition-colors">
                 <Upload className="w-3 h-3" />
               </div>
-              <span>{isTranslating ? "Processing..." : "Import"}</span>
+              <span className="hidden min-[400px]:inline">{isTranslating ? "Processing..." : "Import"}</span>
             </button>
             <input
               type="file"
@@ -1510,12 +1603,12 @@ export default function App() {
               className="hidden"
             />
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-2 sm:gap-3 min-w-0 flex-1 sm:flex-initial">
             {/* Search button */}
             {content.length > 0 && (
               <button
                 onClick={openSearch}
-                className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
+                className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors touch-manipulation"
                 title="搜索 (⌘F)"
                 aria-label="搜索"
               >
@@ -1523,17 +1616,17 @@ export default function App() {
               </button>
             )}
             {/* 仅「译成」可选：简体 / 繁体 / English；原文语种由正文自动识别（见正文区标签） */}
-            <span className="text-[10px] font-sans text-ink/40 shrink-0" title="你要翻译成哪种语言">
+            <span className="text-[10px] font-sans text-ink/40 shrink-0 hidden sm:inline" title="你要翻译成哪种语言">
               译成
             </span>
-            <div className="relative">
+            <div className="relative min-w-0 max-w-[min(52vw,11rem)] sm:max-w-none">
               <select
                 value={targetLang}
                 onChange={(e) => changeTargetLang(e.target.value as TargetLang)}
                 disabled={isTranslating}
                 title={`译文语言：${TARGET_LANG_LABELS[targetLang]}。新导入/粘贴的翻译使用该语言；若已有正文，切换语言后将按左栏原文自动重新翻译。`}
                 aria-label={`译文 ${TARGET_LANG_LABELS[targetLang]}`}
-                className="appearance-none bg-transparent pl-7 pr-6 py-1.5 text-xs font-sans font-medium text-ink/60 hover:text-ink cursor-pointer outline-none border border-ink/10 rounded-full hover:border-ink/20 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                className="appearance-none bg-transparent pl-7 pr-6 py-1.5 text-[11px] sm:text-xs font-sans font-medium text-ink/60 hover:text-ink cursor-pointer outline-none border border-ink/10 rounded-full hover:border-ink/20 transition-colors disabled:opacity-40 disabled:pointer-events-none max-w-full min-w-0"
               >
                 {(Object.entries(TARGET_LANG_LABELS) as [TargetLang, string][]).map(([k, v]) => (
                   <option key={k} value={k} title={v}>
@@ -1546,7 +1639,7 @@ export default function App() {
             </div>
             <button
               onClick={handleExportDocx}
-              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors disabled:opacity-30"
+              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors disabled:opacity-30 touch-manipulation"
               disabled={content.length === 0}
               title="导出为 Word 文档"
               aria-label="导出为 Word 文档"
@@ -1565,7 +1658,7 @@ export default function App() {
                     auth.logout();
                     setLoginInput("");
                   }}
-                  className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
+                  className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors touch-manipulation"
                   title="退出登录"
                   aria-label="退出登录"
                 >
@@ -1576,7 +1669,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => auth.login()}
-                className="px-3 py-1.5 bg-ink text-paper text-[10px] font-sans font-bold uppercase tracking-wider rounded-full hover:bg-vibrant-1 transition-colors"
+                className="px-3 py-1.5 bg-ink text-paper text-[10px] font-sans font-bold uppercase tracking-wider rounded-full hover:bg-vibrant-1 transition-colors touch-manipulation shrink-0"
               >
                 登录
               </button>
@@ -1610,7 +1703,7 @@ export default function App() {
             )}
             <button
               onClick={() => setHelpOpen(true)}
-              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors"
+              className="p-2 -m-2 rounded-full hover:bg-ink/5 transition-colors touch-manipulation"
               title="说明"
               aria-label="说明"
             >
@@ -1628,9 +1721,9 @@ export default function App() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
             transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-            className="sticky top-[64px] z-50 mx-auto max-w-lg px-6 pt-2"
+            className="sticky top-[5.5rem] sm:top-[4.5rem] z-50 mx-auto max-w-lg px-3 sm:px-6 pt-2"
           >
-            <div className="flex items-center gap-2 bg-white/80 backdrop-blur-2xl border border-ink/10 rounded-2xl shadow-lg px-4 py-2.5">
+            <div className="flex flex-wrap items-center gap-2 bg-white/80 backdrop-blur-2xl border border-ink/10 rounded-2xl shadow-lg px-3 sm:px-4 py-2.5">
               <Search className="w-4 h-4 text-ink/30 shrink-0" />
               <input
                 ref={searchInputRef}
@@ -1698,9 +1791,9 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-              className="sticky top-[64px] z-50 mx-auto max-w-2xl px-6"
+              className="sticky top-[5.5rem] sm:top-[4.5rem] z-50 mx-auto max-w-2xl px-3 sm:px-6"
             >
-              <div className="bg-white/80 backdrop-blur-2xl border border-ink/10 rounded-3xl shadow-2xl shadow-ink/10 p-6">
+              <div className="bg-white/80 backdrop-blur-2xl border border-ink/10 rounded-3xl shadow-2xl shadow-ink/10 p-4 sm:p-6">
                 <textarea
                   value={textInput}
                   onChange={(e) => setTextInput(e.target.value)}
@@ -1746,9 +1839,9 @@ export default function App() {
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
               transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-              className="fixed inset-0 z-[90] flex items-center justify-center p-6 pointer-events-none"
+              className="fixed inset-0 z-[90] flex items-center justify-center p-3 sm:p-6 pointer-events-none"
             >
-              <div className="pointer-events-auto w-full max-w-lg max-h-[80vh] overflow-y-auto bg-white/95 backdrop-blur-2xl border border-ink/10 rounded-[2.5rem] shadow-2xl p-10">
+              <div className="pointer-events-auto w-full max-w-lg max-h-[min(85dvh,32rem)] sm:max-h-[80vh] overflow-y-auto bg-white/95 backdrop-blur-2xl border border-ink/10 rounded-3xl sm:rounded-[2.5rem] shadow-2xl p-6 sm:p-10">
                 <div className="flex justify-between items-start mb-8">
                   <div>
                     <h2 className="font-serif text-2xl font-bold text-ink">Aki 的翻译器</h2>
@@ -1783,7 +1876,6 @@ export default function App() {
                     <ul className="space-y-2">
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>翻译 — 顶栏「译成」选择目标语言；原文语种由正文自动识别</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>文学分析 — 目标为自然语言时，自动生成双语摘要、叙事分析、核心主题、剧情梗概、人物介绍、写作优缺点</li>
-                      <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>AKI 码 — 编码为动物密文；大学/城市/歌手等专名下可附 AI 毒舌梗，其余仅密文；粘贴纯密文自动解码；关键词与白名单校名有静态彩蛋；列头「复制」可拷贝密文与本站链接</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>批注 — 选中原文段落中的任意文本，添加批注（类似 Word 批注）</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>导出 — 一键导出为 Word（.docx），批注保留为 Word 原生批注</li>
                       <li className="flex gap-2"><span className="text-vibrant-1 font-bold shrink-0">·</span>历史记录 — 自动保存，支持本地或云端同步</li>
@@ -1906,7 +1998,7 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <main className="max-w-6xl mx-auto px-6 py-16 md:py-32 relative z-10">
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-12 sm:py-16 md:py-32 relative z-10 pb-[max(4rem,env(safe-area-inset-bottom))]">
         <AnimatePresence>
           {error && (
             <motion.div 
@@ -1923,7 +2015,7 @@ export default function App() {
 
         {/* Header Section - 仅当标题或作者非占位符时显示，避免显示四条 — */}
         {[title.zh, title.en, author.zh, author.en].some(t => t?.trim() && !/^[—\-]+$/.test(t.trim())) ? (
-          <header className="mb-32">
+          <header className="mb-16 md:mb-32">
             <motion.div
               initial={{ opacity: 0, y: 30 }}
               animate={{ opacity: 1, y: 0 }}
@@ -1962,16 +2054,18 @@ export default function App() {
               <p className="mt-4 font-sans text-sm text-ink/60 text-center">
                 {progress?.step ?? "处理中..."}
               </p>
-              <p className="mt-1 font-sans text-xs text-ink/40 text-center">
-                {progress?.percent ?? 0}%
-              </p>
+              {!progress?.step?.includes("加载中") ? (
+                <p className="mt-1 font-sans text-xs text-ink/40 text-center">
+                  {progress?.percent ?? 0}%
+                </p>
+              ) : null}
             </div>
           </div>
         )}
 
         {/* Compact Progress - 已有段落显示时，顶部紧凑进度条 */}
         {isTranslating && content.length > 0 && (
-          <div className="sticky top-20 z-40 py-4 px-6 mb-8 rounded-2xl bg-white/60 backdrop-blur-md border border-ink/10 shadow-lg max-w-2xl mx-auto">
+          <div className="sticky top-[5.25rem] sm:top-20 z-40 py-3 sm:py-4 px-4 sm:px-6 mb-6 sm:mb-8 rounded-2xl bg-white/60 backdrop-blur-md border border-ink/10 shadow-lg max-w-2xl mx-auto">
             <div className="h-1.5 bg-ink/10 rounded-full overflow-hidden">
               <motion.div
                 className="h-full bg-ink/40 rounded-full"
@@ -1981,7 +2075,9 @@ export default function App() {
               />
             </div>
             <p className="mt-2 font-sans text-xs text-ink/50 text-center">
-              {progress?.step ?? "翻译中..."} {progress?.percent ?? 0}%
+              {progress?.step?.includes("加载中")
+                ? progress?.step ?? "加载中…"
+                : `${progress?.step ?? "翻译中..."} ${progress?.percent ?? 0}%`}
             </p>
           </div>
         )}
@@ -1993,13 +2089,13 @@ export default function App() {
             <>
             <div className="w-full py-12 border-y border-ink/5 mb-10" aria-label="广告位">
               <h2 className="font-serif text-sm md:text-base font-light tracking-tight text-ink/80 break-words">
-                广告位招租，自定义你的专属密码。akicodehk@gmail.com
+                广告位招租，自定义你的专属彩蛋。akicodehk@gmail.com
               </h2>
             </div>
 
-            <article className="space-y-16">
+            <article className="space-y-10 md:space-y-16">
               {/* Column labels */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 mb-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 sm:gap-12 md:gap-24 mb-2">
                 <div>
                   <span className="font-sans text-[10px] uppercase tracking-[0.4em] font-bold opacity-30">
                     {akiDecodeLayout ? "AKI码" : SOURCE_LANG_LABELS[contentPairSourceLang ?? sourceLang] || "Source"}
@@ -2035,7 +2131,7 @@ export default function App() {
                   viewport={{ once: true, margin: "-50px" }}
                   transition={{ duration: 1.5, ease: [0.22, 1, 0.36, 1] }}
                 >
-                  <div className="relative grid grid-cols-1 md:grid-cols-2 gap-12 md:gap-24 items-start">
+                  <div className="relative grid grid-cols-1 md:grid-cols-2 gap-8 sm:gap-12 md:gap-24 items-start">
                     {/* 原文 — 选字批注 */}
                     <div
                       className={`content-text whitespace-pre-wrap text-ink/80 ${akiDecodeLayout ? "font-mono text-sm tracking-tight" : ""}`}
@@ -2185,8 +2281,8 @@ export default function App() {
 
         {/* Empty State：中央直接粘贴，等价于 Import */}
         {!isTranslating && content.length === 0 && (
-          <div className="max-w-3xl mx-auto py-16 md:py-24">
-            <div className="border border-ink/10 rounded-[2.5rem] bg-white/50 backdrop-blur-md p-8 md:p-12 shadow-sm">
+          <div className="max-w-3xl mx-auto py-10 sm:py-16 md:py-24">
+            <div className="border border-ink/10 rounded-3xl sm:rounded-[2.5rem] bg-white/50 backdrop-blur-md p-5 sm:p-8 md:p-12 shadow-sm">
               <label htmlFor="empty-state-import" className="sr-only">
                 粘贴或输入要翻译的文本
               </label>
@@ -2239,7 +2335,7 @@ export default function App() {
         )}
 
         {/* Footer spacer */}
-        <div className="mt-48" />
+        <div className="mt-24 sm:mt-40 md:mt-48" />
       </main>
 
       <FloatingTextFollowup

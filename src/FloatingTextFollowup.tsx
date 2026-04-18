@@ -127,14 +127,18 @@ export const FloatingTextFollowup: React.FC<FloatingTextFollowupProps> = ({
   };
 
   return (
-    <div className="fixed bottom-6 right-6 z-[65] flex flex-col items-end pointer-events-none">
-      <div className="pointer-events-auto relative flex flex-col items-end">
+    <div
+      className="fixed z-[65] flex flex-col items-stretch sm:items-end pointer-events-none
+        left-3 right-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))]
+        sm:left-auto sm:right-6 sm:bottom-[max(1.5rem,env(safe-area-inset-bottom))] sm:w-auto"
+    >
+      <div className="pointer-events-auto relative flex flex-col items-stretch sm:items-end w-full sm:w-auto">
         <div
           className={`
-          mb-4 w-[22rem] sm:w-96 rounded-2xl shadow-2xl border border-ink/10
+          mb-4 w-full max-w-none sm:w-96 rounded-2xl shadow-2xl border border-ink/10
           bg-paper/90 backdrop-blur-xl overflow-hidden flex flex-col
-          transition-all duration-300 ease-out origin-bottom-right
-          ${isOpen ? 'scale-100 opacity-100 h-[32rem]' : 'scale-50 opacity-0 h-0 pointer-events-none'}
+          transition-all duration-300 ease-out origin-bottom sm:origin-bottom-right
+          ${isOpen ? 'scale-100 opacity-100 h-[min(32rem,70dvh)] sm:h-[32rem]' : 'scale-50 opacity-0 h-0 pointer-events-none'}
         `}
         >
           <div className="px-4 py-3 border-b border-ink/10 flex items-center justify-between bg-white/50">
@@ -252,7 +256,7 @@ export const FloatingTextFollowup: React.FC<FloatingTextFollowupProps> = ({
           aria-expanded={isOpen}
           aria-label={!hasContent ? '请先导入文章以开启追问' : isOpen ? '关闭追问面板' : '打开深度追问'}
           className={`
-          pointer-events-auto flex items-center justify-center w-11 h-11 rounded-full shadow-lg transition-all duration-300
+          pointer-events-auto self-end flex items-center justify-center w-12 h-12 sm:w-11 sm:h-11 rounded-full shadow-lg transition-all duration-300 touch-manipulation
           ${
             hasContent
               ? 'bg-vibrant-1 hover:shadow-vibrant-1/25 hover:-translate-y-0.5 text-paper cursor-pointer'

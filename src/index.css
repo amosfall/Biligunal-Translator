@@ -16,6 +16,8 @@
 @layer base {
   body {
     @apply bg-paper text-ink font-serif antialiased overflow-x-hidden;
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
   }
 }
 
@@ -45,7 +47,7 @@
 }
 
 .content-text {
-  @apply text-base md:text-lg leading-[1.8] text-justify;
+  @apply text-base md:text-lg leading-[1.8] text-justify break-words;
 }
 
 .content-text-zh {

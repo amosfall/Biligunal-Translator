@@ -6,6 +6,8 @@ import {
   buildAkiEasterEgg,
   formatTripleLanguageEgg,
   isLegacyHkuInput,
+  isLegacyMeijiInput,
+  isLegacyZhongXiInput,
   matchAkiEasterEggSource,
 } from "./akiEasterEggs";
 import { encodeAki, wrapAkiDisplay, wrapAkiDisplayIfFirst } from "./customCipher";
@@ -14,7 +16,7 @@ export async function buildAkiTranslatedColumnAsync(
   sourceParagraph: string,
   paragraphIndex: number,
   fetchMeme: (text: string) => Promise<{ zh: string; en: string } | null>,
-  options?: { skipLegacyHku?: boolean }
+  options?: { skipLegacyHku?: boolean; skipLegacyMeiji?: boolean; skipLegacyZhongXi?: boolean }
 ): Promise<string> {
   const egg = matchAkiEasterEggSource(sourceParagraph, options);
   if (egg !== null) {
@@ -53,13 +55,23 @@ export async function applyAkiEncodingToPairsAsync(
     const p = pairs[i]!;
     const sourceText = layout === "to_cjk" ? p.en : p.zh;
     let priorHku = 0;
+    let priorMeiji = 0;
+    let priorZhongXi = 0;
     for (let j = 0; j < i; j++) {
       const prev = pairs[j]!;
       const prevSource = layout === "to_cjk" ? prev.en : prev.zh;
       if (isLegacyHkuInput(prevSource)) priorHku++;
+      if (isLegacyMeijiInput(prevSource)) priorMeiji++;
+      if (isLegacyZhongXiInput(prevSource)) priorZhongXi++;
     }
     const skipLegacyHku = isLegacyHkuInput(sourceText) && priorHku >= 1;
-    const zhCol = await buildAkiTranslatedColumnAsync(sourceText, i, fetchMeme, { skipLegacyHku });
+    const skipLegacyMeiji = isLegacyMeijiInput(sourceText) && priorMeiji >= 1;
+    const skipLegacyZhongXi = isLegacyZhongXiInput(sourceText) && priorZhongXi >= 1;
+    const zhCol = await buildAkiTranslatedColumnAsync(sourceText, i, fetchMeme, {
+      skipLegacyHku,
+      skipLegacyMeiji,
+      skipLegacyZhongXi,
+    });
     out.push({ en: p.en, zh: zhCol });
   }
   return out;

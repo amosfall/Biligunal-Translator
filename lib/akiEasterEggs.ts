@@ -5,9 +5,6 @@
 
 import { UNIVERSITY_ROWS, type UniVariation } from "./uniEasterData";
 
-/** AKI 静态白名单高校：仅这两条的 match 仍走本地随机梗；其余高校名改由 LLM 动态生成 */
-const AKI_STATIC_UNI_MATCH_KEYS = new Set(["中央戏剧学院", "明治大学"]);
-
 export type AkiEasterKind = "hku" | "i_love_you" | "aki_name";
 
 /** 匹配结果：旧版关键词或高校彩蛋 */
@@ -88,9 +85,23 @@ export function isLegacyHkuInput(raw: string): boolean {
   return lower === "hku" || t === "香港大学";
 }
 
+/** 与明治大学静态彩蛋同键（整段为「明治大学」），用于「首次静态、同文档或会话内再次则走动态梗」 */
+export function isLegacyMeijiInput(raw: string): boolean {
+  const t = normalizeEasterInput(raw);
+  if (!t) return false;
+  return uniRowMatchEquals(t, "明治大学");
+}
+
+/** 与中央戏剧学院静态彩蛋同键（整段为「中央戏剧学院」），策略同明治 / HKU */
+export function isLegacyZhongXiInput(raw: string): boolean {
+  const t = normalizeEasterInput(raw);
+  if (!t) return false;
+  return uniRowMatchEquals(t, "中央戏剧学院");
+}
+
 export function matchAkiEasterEggSource(
   raw: string,
-  options?: { skipLegacyHku?: boolean }
+  options?: { skipLegacyHku?: boolean; skipLegacyMeiji?: boolean; skipLegacyZhongXi?: boolean }
 ): AkiEasterMatch | null {
   const t = normalizeEasterInput(raw);
   if (!t) return null;
@@ -107,10 +118,19 @@ export function matchAkiEasterEggSource(
     return { type: "legacy", kind: "aki_name" };
   }
 
-  for (const row of UNIVERSITY_ROWS) {
-    if (!AKI_STATIC_UNI_MATCH_KEYS.has(row.match)) continue;
-    if (uniRowMatchEquals(t, row.match)) {
-      return { type: "uni", official: row.match, variations: row.variations };
+  /** 明治大学：与 HKU 相同，skipLegacyMeiji 时改走与其他高校相同的动态生成 */
+  if (!options?.skipLegacyMeiji) {
+    const meijiRow = UNIVERSITY_ROWS.find((r) => r.match === "明治大学");
+    if (meijiRow && uniRowMatchEquals(t, "明治大学")) {
+      return { type: "uni", official: meijiRow.match, variations: meijiRow.variations };
+    }
+  }
+
+  /** 中央戏剧学院：同上 */
+  if (!options?.skipLegacyZhongXi) {
+    const zxRow = UNIVERSITY_ROWS.find((r) => r.match === "中央戏剧学院");
+    if (zxRow && uniRowMatchEquals(t, "中央戏剧学院")) {
+      return { type: "uni", official: zxRow.match, variations: zxRow.variations };
     }
   }
 
@@ -150,12 +170,27 @@ function buildUniversityEgg(
   return formatTripleLanguageEgg({ cipherSource: official, zh: v.zh, en: v.en }, deps);
 }
 
+/** 首次静态、再次输入可走动态梗的键：HKU、明治大学、中央戏剧学院 */
+export const AKI_SECOND_INPUT_HINT = "（再输一次获取新答案）";
+
+function matchUsesFirstStaticThenDynamicHint(m: AkiEasterMatch): boolean {
+  if (m.type === "legacy" && m.kind === "hku") return true;
+  if (m.type === "uni" && (m.official === "明治大学" || m.official === "中央戏剧学院")) return true;
+  return false;
+}
+
 export function buildAkiEasterEgg(
   match: AkiEasterMatch,
   deps: { encodeAki: (text: string) => string; wrapCipherLine: (body: string) => string }
 ): string {
+  let body: string;
   if (match.type === "legacy") {
-    return formatTripleLanguageEgg(EASTER_TRIPLE[match.kind], deps);
+    body = formatTripleLanguageEgg(EASTER_TRIPLE[match.kind], deps);
+  } else {
+    body = buildUniversityEgg(match.official, match.variations, deps);
   }
-  return buildUniversityEgg(match.official, match.variations, deps);
+  if (matchUsesFirstStaticThenDynamicHint(match)) {
+    return `${body}\n\n${AKI_SECOND_INPUT_HINT}`;
+  }
+  return body;
 }
